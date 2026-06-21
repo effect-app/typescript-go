@@ -1129,12 +1129,35 @@ func (r *EmitResolver) getTypeOfClassSchemaProperty(declaration *ast.Node, prope
 	if schemaExpression == nil {
 		return nil
 	}
+	return r.getTypeOfSchemaExpressionProperty(schemaExpression, propertyName)
+}
+
+func (r *EmitResolver) getTypeOfSchemaExpressionProperty(schemaExpression *ast.Node, propertyName string) *Type {
 	schemaType := r.checker.getTypeOfExpression(schemaExpression)
 	property := r.checker.getPropertyOfType(schemaType, propertyName)
 	if property == nil {
 		return nil
 	}
 	return r.checker.GetTypeOfSymbolAtLocation(property, schemaExpression)
+}
+
+// Like CreateTypeOfClassStaticProperty, but for a `const X = S.Struct(...)` schema value:
+// reads propertyName (Encoded / Type / ~type.make.in / DecodingServices / ...) off the type
+// of the const's initializer and serializes the resolved type. Serializing the resolved type
+// keeps `never` as `never` and never synthesizes references that could fail to resolve.
+func (r *EmitResolver) CreateTypeOfStructSchemaProperty(emitContext *printer.EmitContext, declaration *ast.Node, propertyName string, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil || !ast.IsVariableDeclaration(declaration) || declaration.AsVariableDeclaration().Initializer == nil {
+		return nil
+	}
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	propertyType := r.getTypeOfSchemaExpressionProperty(declaration.AsVariableDeclaration().Initializer, propertyName)
+	if propertyType == nil {
+		return nil
+	}
+	structNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+	return structNodeBuilder.TypeToTypeNode(propertyType, enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals|nodebuilder.FlagsUseFullyQualifiedType, internalFlags, tracker)
 }
 
 func getClassSchemaExpression(declaration *ast.Node) *ast.Node {
