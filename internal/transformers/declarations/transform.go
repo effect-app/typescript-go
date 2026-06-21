@@ -2475,14 +2475,48 @@ func getFirstHeritageType(classDeclaration *ast.Node) *ast.Node {
 }
 
 func isEffectSchemaOpaqueExpression(expression *ast.Node) bool {
+	return getEffectSchemaCtorFacadeName(expression) != ""
+}
+
+// Maps a schema-model heritage constructor (S.Opaque(...), S.Class(...), S.ErrorClass(...), ...)
+// to the effect-app facade type its base should be rewritten to. Returns "" for non-model
+// constructors. Opaque family (incl. requests) -> OpaqueFacade; class family -> OpaqueClassFacade;
+// error family -> OpaqueErrorFacadeClass.
+func getEffectSchemaCtorFacadeName(expression *ast.Node) string {
 	if !ast.IsPropertyAccessExpression(expression) || expression.Name() == nil || expression.Expression() == nil {
-		return false
-	}
-	if expression.Name().Text() != "Opaque" && expression.Name().Text() != "OpaqueFacade" {
-		return false
+		return ""
 	}
 	left := expression.Expression()
-	return ast.IsIdentifier(left) && (left.Text() == "S" || left.Text() == "Schema")
+	if !ast.IsIdentifier(left) || (left.Text() != "S" && left.Text() != "Schema") {
+		return ""
+	}
+	switch expression.Name().Text() {
+	case "Opaque", "OpaqueFacade":
+		return "OpaqueFacade"
+	case "Class", "TaggedClass":
+		return "OpaqueClassFacade"
+	case "ErrorClass", "TaggedErrorClass":
+		return "OpaqueErrorFacadeClass"
+	default:
+		return ""
+	}
+}
+
+func getEffectSchemaClassFacadeName(classDeclaration *ast.Node) string {
+	heritageType := getFirstHeritageType(classDeclaration)
+	if heritageType == nil {
+		return "OpaqueFacade"
+	}
+	expression := heritageType.AsExpressionWithTypeArguments().Expression
+	for expression != nil && ast.IsCallExpression(expression) {
+		expression = expression.AsCallExpression().Expression
+	}
+	if expression != nil {
+		if name := getEffectSchemaCtorFacadeName(expression); name != "" {
+			return name
+		}
+	}
+	return "OpaqueFacade"
 }
 
 func isEffectSchemaModelNamespace(statement *ast.Node) bool {
@@ -2707,7 +2741,7 @@ func (tx *DeclarationTransformer) updateEffectSchemaBaseDeclaration(statement *a
 		declaration.AsVariableDeclaration(),
 		name,
 		declaration.AsVariableDeclaration().ExclamationToken,
-		tx.createEffectSchemaFacadeBaseType(modelName, classDeclaration),
+		tx.createEffectSchemaFacadeBaseType(modelName, classDeclaration, declaration.AsVariableDeclaration().Type),
 		declaration.AsVariableDeclaration().Initializer,
 	)
 	declarations := tx.Factory().NewNodeList([]*ast.Node{updatedDeclaration})
@@ -2804,7 +2838,7 @@ func (tx *DeclarationTransformer) updateEffectSchemaRequestBaseDeclaration(state
 
 func (tx *DeclarationTransformer) updateEffectSchemaRequestBaseType(typeNode *ast.Node, info effectSchemaRequestBaseInfo) *ast.Node {
 	if isEffectSchemaRequestOpaqueType(typeNode, info.modelName) {
-		return tx.createEffectSchemaFacadeTypeReference(info.modelName, info.brand)
+		return tx.createEffectSchemaFacadeTypeReference(info.modelName, info.brand, "OpaqueFacade")
 	}
 	if typeNode == nil || typeNode.Kind != ast.KindIntersectionType {
 		return nil
@@ -2814,7 +2848,7 @@ func (tx *DeclarationTransformer) updateEffectSchemaRequestBaseType(typeNode *as
 	for _, part := range typeNode.AsIntersectionTypeNode().Types.Nodes {
 		if isEffectSchemaRequestOpaqueType(part, info.modelName) {
 			changed = true
-			types = append(types, tx.createEffectSchemaFacadeTypeReference(info.modelName, info.brand))
+			types = append(types, tx.createEffectSchemaFacadeTypeReference(info.modelName, info.brand, "OpaqueFacade"))
 		} else {
 			types = append(types, part)
 		}
@@ -2858,17 +2892,45 @@ func (tx *DeclarationTransformer) updateEffectSchemaClassDeclaration(classDeclar
 	)
 }
 
-func (tx *DeclarationTransformer) createEffectSchemaFacadeBaseType(modelName string, classDeclaration *ast.Node) *ast.Node {
+func (tx *DeclarationTransformer) createEffectSchemaFacadeBaseType(modelName string, classDeclaration *ast.Node, baseType *ast.Node) *ast.Node {
+	facadeName := getEffectSchemaClassFacadeName(classDeclaration)
+	brandType := tx.getEffectSchemaFacadeBrandType(baseType, facadeName)
 	return tx.Factory().NewIntersectionTypeNode(tx.Factory().NewNodeList([]*ast.Node{
-		tx.createEffectSchemaFacadeTypeReference(modelName, tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList([]*ast.Node{}))),
+		tx.createEffectSchemaFacadeTypeReference(modelName, brandType, facadeName),
 		tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList(tx.createEffectSchemaStaticMembers(classDeclaration))),
 	}))
 }
 
-func (tx *DeclarationTransformer) createEffectSchemaFacadeTypeReference(modelName string, brandType *ast.Node) *ast.Node {
+// The facade's Brand (last type arg). For the class/error families the source base is
+// S.EnhancedClass<Self, Schema, Inherited> — the 3rd arg is the brand (e.g. Cause.YieldableError
+// for errors); preserve it. The Opaque family carries no brand on the base, so use {}.
+func (tx *DeclarationTransformer) getEffectSchemaFacadeBrandType(baseType *ast.Node, facadeName string) *ast.Node {
+	empty := tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList([]*ast.Node{}))
+	if facadeName == "OpaqueFacade" || baseType == nil {
+		return empty
+	}
+	typeNode := baseType
+	if ast.IsIntersectionTypeNode(typeNode) {
+		nodes := typeNode.AsIntersectionTypeNode().Types.Nodes
+		if len(nodes) == 0 {
+			return empty
+		}
+		typeNode = nodes[0]
+	}
+	if typeNode.Kind != ast.KindTypeReference || typeNode.AsTypeReferenceNode().TypeArguments == nil {
+		return empty
+	}
+	args := typeNode.AsTypeReferenceNode().TypeArguments.Nodes
+	if len(args) >= 3 {
+		return args[2]
+	}
+	return empty
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaFacadeTypeReference(modelName string, brandType *ast.Node, facadeName string) *ast.Node {
 	model := tx.Factory().NewIdentifier(modelName)
 	return tx.Factory().NewTypeReferenceNode(
-		tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier("S"), tx.Factory().NewIdentifier("OpaqueFacade")),
+		tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier("S"), tx.Factory().NewIdentifier(facadeName)),
 		tx.Factory().NewNodeList([]*ast.Node{
 			tx.Factory().NewTypeReferenceNode(model, nil),
 			tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(model, tx.Factory().NewIdentifier("Encoded")), nil),
