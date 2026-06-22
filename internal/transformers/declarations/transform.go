@@ -2874,34 +2874,13 @@ func isEffectSchemaStructNestedEncodedInterfaceForModel(statement *ast.Node, mod
 	return exprName != nil && ast.IsIdentifier(exprName) && exprName.Text() == modelName
 }
 
-func (tx *DeclarationTransformer) expressionToEntityName(expression *ast.Node) *ast.Node {
-	if ast.IsIdentifier(expression) {
-		return expression
-	}
-	if ast.IsPropertyAccessExpression(expression) && expression.Name() != nil {
-		left := tx.expressionToEntityName(expression.AsPropertyAccessExpression().Expression)
-		if left != nil {
-			return tx.Factory().NewQualifiedName(left, expression.Name())
-		}
-	}
-	return nil
-}
-
 func (tx *DeclarationTransformer) materializeSchemaNestedEncoded(encoded *ast.Node) *ast.Node {
 	heritageType := encoded.AsInterfaceDeclaration().HeritageClauses.Nodes[0].AsHeritageClause().Types.Nodes[0]
-	typeName := tx.expressionToEntityName(heritageType.AsExpressionWithTypeArguments().Expression)
-	if typeName == nil {
-		return nil
-	}
-	typeNode := tx.Factory().NewTypeReferenceNode(typeName, heritageType.AsExpressionWithTypeArguments().TypeArguments)
-	return tx.resolver.CreateTypeLiteralOfTypeNode(tx.EmitContext(), typeNode, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	return tx.resolver.CreateTypeLiteralOfTypeNode(tx.EmitContext(), heritageType, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
 }
 
 func (tx *DeclarationTransformer) createEffectSchemaMaterializedEncodedDeclaration(encoded *ast.Node, classDeclaration *ast.Node) *ast.Node {
-	encodedType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeLiteralOfClassStaticProperty(tx.EmitContext(), classDeclaration, "Encoded", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
-	if encodedType == nil {
-		encodedType = tx.materializeSchemaNestedEncoded(encoded)
-	}
+	encodedType := tx.materializeSchemaNestedEncoded(encoded)
 	if encodedType == nil || !ast.IsTypeLiteralNode(encodedType) {
 		return nil
 	}
