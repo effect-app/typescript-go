@@ -62,6 +62,15 @@ The facade materializes the named interfaces **once** at emit, so every program 
 The saving therefore **scales with the number of programs / project references / parallel checkers**;
 a many-reference monorepo is the worst case for stock and the best case for the facade.
 
+**Not just performance — correctness.** When the schema generics get deep enough the checker hits its
+instantiation/depth limits and **silently** infers `unknown` / `any` for whole views (services,
+constructor / `make` members, `Type` / `Encoded`) — no error, the program type-checks green against a
+degraded type. It is **non-deterministic** and shows up most under **tsgo's default multi-threaded
+mode** (each worker hits the wall independently). Materializing the views as named literals once at
+emit makes them fully resolved and stable for every consumer; adopting it surfaced **several real
+bugs** in our codebase that the silent `any`/`unknown` had masked. So this removes a class of silent,
+non-deterministic type degradations on top of the instantiation cut.
+
 ---
 
 ## How
