@@ -2543,7 +2543,7 @@ func (tx *DeclarationTransformer) materializeEffectSchemaStructProperty(modelNam
 	if declaration == nil {
 		return nil
 	}
-	return tx.resolver.CreateTypeOfStructSchemaProperty(tx.EmitContext(), declaration, propertyName, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	return tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfStructSchemaProperty(tx.EmitContext(), declaration, propertyName, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 }
 
 func (tx *DeclarationTransformer) canCreateEffectSchemaGeneratedStructNamespace(modelName string) bool {
@@ -2656,6 +2656,94 @@ func (tx *DeclarationTransformer) createEffectSchemaStructDeclarations(statement
 	retypedConst := tx.Factory().UpdateVariableStatement(statement.AsVariableStatement(), statement.Modifiers(), declarationList)
 	typeInterface := tx.Factory().NewInterfaceDeclaration(tx.effectSchemaStructModifiers(exported, false), tx.Factory().NewIdentifier(modelName), nil, nil, tx.Factory().NewNodeList(typeNode.AsTypeLiteralNode().Members.Nodes))
 	return []*ast.Node{retypedConst, typeInterface, namespace}
+}
+
+type generatedTypeImport struct {
+	importedName    string
+	moduleSpecifier string
+}
+
+func (tx *DeclarationTransformer) generatedTypeNamedImports() map[string]generatedTypeImport {
+	imports := map[string]generatedTypeImport{}
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		if !ast.IsImportDeclaration(statement) {
+			continue
+		}
+		decl := statement.AsImportDeclaration()
+		if decl.ModuleSpecifier == nil || !ast.IsStringLiteralLike(decl.ModuleSpecifier) || decl.ImportClause == nil || decl.ImportClause.AsImportClause().NamedBindings == nil {
+			continue
+		}
+		moduleSpecifier := decl.ModuleSpecifier.Text()
+		namedBindings := decl.ImportClause.AsImportClause().NamedBindings
+		if !ast.IsNamedImports(namedBindings) {
+			continue
+		}
+		for _, specifier := range namedBindings.AsNamedImports().Elements.Nodes {
+			importedName := specifier.Name().Text()
+			if specifier.AsImportSpecifier().PropertyName != nil {
+				importedName = specifier.AsImportSpecifier().PropertyName.Text()
+			}
+			imports[specifier.Name().Text()] = generatedTypeImport{importedName: importedName, moduleSpecifier: moduleSpecifier}
+		}
+	}
+	return imports
+}
+
+func (tx *DeclarationTransformer) generatedTypeNamespaceImports() map[string]string {
+	imports := map[string]string{}
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		if !ast.IsImportDeclaration(statement) {
+			continue
+		}
+		decl := statement.AsImportDeclaration()
+		if decl.ModuleSpecifier == nil || !ast.IsStringLiteralLike(decl.ModuleSpecifier) || decl.ImportClause == nil || decl.ImportClause.AsImportClause().NamedBindings == nil {
+			continue
+		}
+		namedBindings := decl.ImportClause.AsImportClause().NamedBindings
+		if ast.IsNamespaceImport(namedBindings) {
+			imports[decl.ModuleSpecifier.Text()] = namedBindings.Name().Text()
+		}
+	}
+	return imports
+}
+
+func (tx *DeclarationTransformer) normalizeGeneratedImportedTypes(typeNode *ast.Node) *ast.Node {
+	if typeNode == nil {
+		return nil
+	}
+	namedImports := tx.generatedTypeNamedImports()
+	if len(namedImports) == 0 {
+		return typeNode
+	}
+	namespaceImports := tx.generatedTypeNamespaceImports()
+	var visitor *ast.NodeVisitor
+	visitor = tx.EmitContext().NewNodeVisitor(func(node *ast.Node) *ast.Node {
+		if node != nil && node.Kind == ast.KindTypeReference {
+			typeReference := node.AsTypeReferenceNode()
+			if typeReference.TypeName != nil && typeReference.TypeName.Kind == ast.KindIdentifier {
+				imported := namedImports[typeReference.TypeName.Text()]
+				if imported.importedName == "" || imported.moduleSpecifier == "" {
+					return visitor.VisitEachChild(node)
+				}
+				typeArguments := visitor.VisitNodes(typeReference.TypeArguments)
+				if namespaceName := namespaceImports[imported.moduleSpecifier]; namespaceName != "" {
+					return tx.Factory().NewTypeReferenceNode(
+						tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier(namespaceName), tx.Factory().NewIdentifier(imported.importedName)),
+						typeArguments,
+					)
+				}
+				return tx.Factory().NewImportTypeNode(
+					false,
+					tx.Factory().NewLiteralTypeNode(tx.Factory().NewStringLiteral(imported.moduleSpecifier, ast.TokenFlagsNone)),
+					nil,
+					tx.Factory().NewIdentifier(imported.importedName),
+					typeArguments,
+				)
+			}
+		}
+		return visitor.VisitEachChild(node)
+	})
+	return visitor.VisitNode(typeNode)
 }
 
 func isEffectSchemaStructCompanionTypeAlias(statement *ast.Node, structModelNames map[string]bool) bool {
@@ -2808,7 +2896,7 @@ func (tx *DeclarationTransformer) createEffectSchemaTypeInterface(classDeclarati
 	if classDeclaration == nil || classDeclaration.Name() == nil {
 		return nil
 	}
-	literal := tx.resolver.CreateTypeLiteralOfClassDeclaration(tx.EmitContext(), classDeclaration, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	literal := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeLiteralOfClassDeclaration(tx.EmitContext(), classDeclaration, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	if literal == nil || !ast.IsTypeLiteralNode(literal) {
 		return nil
 	}
@@ -2896,7 +2984,7 @@ func (tx *DeclarationTransformer) createEffectSchemaNamespaceModifiers(classDecl
 }
 
 func (tx *DeclarationTransformer) createEffectSchemaEncodedDeclaration(classDeclaration *ast.Node) *ast.Node {
-	encodedType := tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "Encoded", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	encodedType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "Encoded", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	if encodedType == nil {
 		return nil
 	}
@@ -2907,9 +2995,9 @@ func (tx *DeclarationTransformer) createEffectSchemaEncodedDeclaration(classDecl
 }
 
 func (tx *DeclarationTransformer) createEffectSchemaMakeDeclaration(classDeclaration *ast.Node) *ast.Node {
-	makeType := tx.resolver.CreateMakeTypeOfClassDeclaration(tx.EmitContext(), classDeclaration, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	makeType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateMakeTypeOfClassDeclaration(tx.EmitContext(), classDeclaration, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	if makeType == nil {
-		makeType = tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "~type.make.in", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+		makeType = tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "~type.make.in", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	}
 	if makeType == nil {
 		return nil
@@ -2921,7 +3009,7 @@ func (tx *DeclarationTransformer) createEffectSchemaMakeDeclaration(classDeclara
 }
 
 func (tx *DeclarationTransformer) createEffectSchemaServiceDeclaration(classDeclaration *ast.Node, name string) *ast.Node {
-	resolved := tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	resolved := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	if resolved == nil {
 		return nil
 	}
@@ -3173,7 +3261,7 @@ func (tx *DeclarationTransformer) createEffectSchemaStaticMembers(classDeclarati
 }
 
 func (tx *DeclarationTransformer) addSchemaStaticMember(members *[]*ast.Node, classDeclaration *ast.Node, name string, readonly bool) {
-	typeNode := tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+	typeNode := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	if typeNode == nil || typeNode.Kind == ast.KindAnyKeyword {
 		return
 	}
