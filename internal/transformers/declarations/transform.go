@@ -2972,6 +2972,11 @@ func (tx *DeclarationTransformer) updateEffectSchemaNamespaceDeclaration(namespa
 	if encodingServices := tx.createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices"); encodingServices != nil {
 		additions = append(additions, encodingServices)
 	}
+	if !existing["Fields"] {
+		if fieldsDeclaration := tx.createEffectSchemaFieldsDeclaration(classDeclaration); fieldsDeclaration != nil {
+			additions = append([]*ast.Node{fieldsDeclaration}, additions...)
+		}
+	}
 	if !replacedEncoded && len(additions) == 0 && len(existing) == 0 {
 		return nil
 	}
@@ -2987,6 +2992,9 @@ func (tx *DeclarationTransformer) createEffectSchemaGeneratedNamespaceDeclaratio
 		return nil
 	}
 	statements := []*ast.Node{encoded}
+	if fieldsDeclaration := tx.createEffectSchemaFieldsDeclaration(classDeclaration); fieldsDeclaration != nil {
+		statements = append(statements, fieldsDeclaration)
+	}
 	if makeDeclaration := tx.createEffectSchemaMakeDeclaration(classDeclaration); makeDeclaration != nil {
 		statements = append(statements, makeDeclaration)
 	}
@@ -3016,6 +3024,17 @@ func (tx *DeclarationTransformer) createEffectSchemaNamespaceModifiers(classDecl
 		return nil
 	}
 	return tx.Factory().NewModifierList(modifiers)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaFieldsDeclaration(classDeclaration *ast.Node) *ast.Node {
+	fieldsType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "fields", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if fieldsType == nil || fieldsType.Kind == ast.KindAnyKeyword {
+		return nil
+	}
+	if ast.IsTypeLiteralNode(fieldsType) {
+		return tx.Factory().NewInterfaceDeclaration(nil, tx.Factory().NewIdentifier("Fields"), nil, nil, tx.Factory().NewNodeList(fieldsType.AsTypeLiteralNode().Members.Nodes))
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier("Fields"), nil, fieldsType)
 }
 
 func (tx *DeclarationTransformer) createEffectSchemaEncodedDeclaration(classDeclaration *ast.Node) *ast.Node {
@@ -3237,7 +3256,7 @@ func (tx *DeclarationTransformer) createEffectSchemaFacadeBaseType(modelName str
 	brandType := tx.getEffectSchemaFacadeBrandType(baseType, facadeName)
 	return tx.Factory().NewIntersectionTypeNode(tx.Factory().NewNodeList([]*ast.Node{
 		tx.createEffectSchemaFacadeTypeReference(modelName, brandType, facadeName),
-		tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList(tx.createEffectSchemaStaticMembers(classDeclaration))),
+		tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList(tx.createEffectSchemaStaticMembers(classDeclaration, modelName))),
 	}))
 }
 
@@ -3282,20 +3301,115 @@ func (tx *DeclarationTransformer) createEffectSchemaFacadeTypeReference(modelNam
 	)
 }
 
-func (tx *DeclarationTransformer) createEffectSchemaStaticMembers(classDeclaration *ast.Node) []*ast.Node {
+func (tx *DeclarationTransformer) createEffectSchemaStaticMembers(classDeclaration *ast.Node, modelName string) []*ast.Node {
 	members := []*ast.Node{}
+	hasFields := tx.createEffectSchemaFieldsDeclaration(classDeclaration) != nil
 	// NOTE: `identifier` (generic `string`) is intentionally NOT emitted here — it lives on the
 	// facade interfaces (OpaqueFacade/OpaqueClassFacade/OpaqueErrorFacadeClass) in effect-app.
 	// Only per-model, precisely-typed statics belong here.
-	tx.addSchemaStaticMember(&members, classDeclaration, "fields", true)
-	tx.addSchemaStaticMember(&members, classDeclaration, "mapFields", false)
-	tx.addSchemaStaticMember(&members, classDeclaration, "to", true)
-	tx.addSchemaStaticMember(&members, classDeclaration, "from", true)
-	tx.addSchemaStaticMember(&members, classDeclaration, "copy", true)
+	tx.addSchemaStaticMember(&members, classDeclaration, "fields", true, core.IfElse(hasFields, modelName, ""))
+	tx.addSchemaStaticMember(&members, classDeclaration, "mapFields", false, core.IfElse(hasFields, modelName, ""))
+	tx.addSchemaStaticMember(&members, classDeclaration, "to", true, "")
+	tx.addSchemaStaticMember(&members, classDeclaration, "from", true, "")
+	tx.addSchemaStaticMember(&members, classDeclaration, "copy", true, modelName)
 	return members
 }
 
-func (tx *DeclarationTransformer) addSchemaStaticMember(members *[]*ast.Node, classDeclaration *ast.Node, name string, readonly bool) {
+func (tx *DeclarationTransformer) createEffectSchemaNamedMemberReference(modelName string, memberName string) *ast.Node {
+	return tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier(modelName), tx.Factory().NewIdentifier(memberName)), nil)
+}
+
+func (tx *DeclarationTransformer) rewriteEffectSchemaStaticMemberType(typeNode *ast.Node, name string, modelName string) *ast.Node {
+	switch name {
+	case "fields":
+		return tx.createEffectSchemaNamedMemberReference(modelName, "Fields")
+	case "mapFields":
+		return tx.rewriteEffectSchemaMapFieldsType(typeNode, modelName)
+	case "copy":
+		return tx.rewriteEffectSchemaCopyType(typeNode, modelName)
+	default:
+		return typeNode
+	}
+}
+
+func (tx *DeclarationTransformer) rewriteEffectSchemaMapFieldsType(typeNode *ast.Node, modelName string) *ast.Node {
+	if typeNode == nil || typeNode.Kind != ast.KindFunctionType {
+		return typeNode
+	}
+	mapFieldsType := typeNode.AsFunctionTypeNode()
+	if mapFieldsType.Parameters == nil || len(mapFieldsType.Parameters.Nodes) == 0 {
+		return typeNode
+	}
+	callbackParameter := mapFieldsType.Parameters.Nodes[0].AsParameterDeclaration()
+	callbackType := callbackParameter.Type
+	if callbackType == nil || callbackType.Kind != ast.KindFunctionType {
+		return typeNode
+	}
+	callbackFunctionType := callbackType.AsFunctionTypeNode()
+	if callbackFunctionType.Parameters == nil || len(callbackFunctionType.Parameters.Nodes) == 0 {
+		return typeNode
+	}
+	fieldsParameter := callbackFunctionType.Parameters.Nodes[0].AsParameterDeclaration()
+	updatedFieldsParameter := tx.Factory().UpdateParameterDeclaration(
+		fieldsParameter,
+		fieldsParameter.Modifiers(),
+		fieldsParameter.DotDotDotToken,
+		fieldsParameter.Name(),
+		fieldsParameter.QuestionToken,
+		tx.createEffectSchemaNamedMemberReference(modelName, "Fields"),
+		fieldsParameter.Initializer,
+	)
+	updatedCallbackParameters := append([]*ast.Node{updatedFieldsParameter}, callbackFunctionType.Parameters.Nodes[1:]...)
+	updatedCallbackType := tx.Factory().UpdateFunctionTypeNode(
+		callbackFunctionType,
+		callbackFunctionType.TypeParameters,
+		tx.Factory().NewNodeList(updatedCallbackParameters),
+		callbackFunctionType.Type,
+	)
+	updatedCallbackParameter := tx.Factory().UpdateParameterDeclaration(
+		callbackParameter,
+		callbackParameter.Modifiers(),
+		callbackParameter.DotDotDotToken,
+		callbackParameter.Name(),
+		callbackParameter.QuestionToken,
+		updatedCallbackType,
+		callbackParameter.Initializer,
+	)
+	updatedMapFieldsParameters := append([]*ast.Node{updatedCallbackParameter}, mapFieldsType.Parameters.Nodes[1:]...)
+	return tx.Factory().UpdateFunctionTypeNode(
+		mapFieldsType,
+		mapFieldsType.TypeParameters,
+		tx.Factory().NewNodeList(updatedMapFieldsParameters),
+		mapFieldsType.Type,
+	)
+}
+
+func (tx *DeclarationTransformer) rewriteEffectSchemaCopyType(typeNode *ast.Node, modelName string) *ast.Node {
+	model := tx.Factory().NewTypeReferenceNode(tx.Factory().NewIdentifier(modelName), nil)
+	if ast.IsImportTypeNode(typeNode) {
+		importType := typeNode.AsImportTypeNode()
+		if importType.Qualifier != nil && rightmostEntityNameText(importType.Qualifier) == "StructuralCopyOrigin" {
+			return tx.Factory().UpdateImportTypeNode(importType, importType.IsTypeOf, importType.Argument, importType.Attributes, importType.Qualifier, tx.Factory().NewNodeList([]*ast.Node{model}))
+		}
+		return typeNode
+	}
+	if ast.IsTypeReferenceNode(typeNode) && rightmostEntityNameText(typeNode.AsTypeReferenceNode().TypeName) == "StructuralCopyOrigin" {
+		return tx.Factory().UpdateTypeReferenceNode(typeNode.AsTypeReferenceNode(), typeNode.AsTypeReferenceNode().TypeName, tx.Factory().NewNodeList([]*ast.Node{model}))
+	}
+	return typeNode
+}
+
+func rightmostEntityNameText(name *ast.Node) string {
+	if ast.IsIdentifier(name) {
+		return name.Text()
+	}
+	if ast.IsQualifiedName(name) {
+		return name.AsQualifiedName().Right.Text()
+	}
+	return ""
+}
+
+func (tx *DeclarationTransformer) addSchemaStaticMember(members *[]*ast.Node, classDeclaration *ast.Node, name string, readonly bool, modelName string) {
 	typeNode := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
 	if typeNode == nil || typeNode.Kind == ast.KindAnyKeyword {
 		return
@@ -3303,6 +3417,9 @@ func (tx *DeclarationTransformer) addSchemaStaticMember(members *[]*ast.Node, cl
 	var modifiers *ast.ModifierList
 	if readonly {
 		modifiers = tx.Factory().NewModifierList([]*ast.Node{tx.Factory().NewModifier(ast.KindReadonlyKeyword)})
+	}
+	if modelName != "" {
+		typeNode = tx.rewriteEffectSchemaStaticMemberType(typeNode, name, modelName)
 	}
 	*members = append(*members, tx.Factory().NewPropertySignatureDeclaration(modifiers, tx.Factory().NewIdentifier(name), nil, typeNode, nil))
 }
