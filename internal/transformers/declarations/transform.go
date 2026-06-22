@@ -2611,10 +2611,10 @@ func (tx *DeclarationTransformer) createEffectSchemaGeneratedStructNamespace(mod
 	)
 }
 
-// `import("#lib/StructFacade").StructFacade<X, X.Encoded, X.Make, X.DecodingServices,
-// X.EncodingServices, X.Fields>` — a self-contained import type resolved cross-package via
-// the api package's `#lib/*` subpath import. The scanner-local facade extends
-// `S.Struct<Fields>`, so the value stays Workflow-compatible.
+// `S.StructFacade<X, X.Encoded, X.Make, X.DecodingServices, X.EncodingServices, X.Fields>` —
+// `StructFacade` is exported from effect-app (>= 4.0.0-beta.279), so it resolves through the
+// file's own `S` (effect-app/Schema) import, exactly like `S.OpaqueFacade`. It extends
+// `S.Struct<Fields>`, so the faceted value stays Workflow-compatible.
 func (tx *DeclarationTransformer) createEffectSchemaStructFacadeType(modelName string) *ast.Node {
 	member := func(name string) *ast.Node {
 		return tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier(modelName), tx.Factory().NewIdentifier(name)), nil)
@@ -2627,8 +2627,10 @@ func (tx *DeclarationTransformer) createEffectSchemaStructFacadeType(modelName s
 		member("EncodingServices"),
 		member("Fields"),
 	})
-	argument := tx.Factory().NewLiteralTypeNode(tx.Factory().NewStringLiteral("#lib/StructFacade", ast.TokenFlagsNone))
-	return tx.Factory().NewImportTypeNode(false, argument, nil, tx.Factory().NewIdentifier("StructFacade"), typeArguments)
+	return tx.Factory().NewTypeReferenceNode(
+		tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier("S"), tx.Factory().NewIdentifier("StructFacade")),
+		typeArguments,
+	)
 }
 
 func (tx *DeclarationTransformer) createEffectSchemaStructDeclarations(statement *ast.Node, modelName string) []*ast.Node {
