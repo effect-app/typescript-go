@@ -53,6 +53,15 @@ codegen purely text-based, keeps source clean, and expands each model once.
 The facade pins the whole `S.Bottom` surface, so consumers never re-derive any Bottom field from
 `fields`.
 
+**Why it compounds:** TypeScript's instantiation cache is **per `Program`**, not global. Each
+project reference is its own `Program` and re-instantiates every schema generic it touches from the
+dependency `.d.ts`; each parallel checker has its own cache (tsgo multi ≈ 2.2× single); editor /
+`tsc` / build / test configs are each another program. So a stock model (inline `S.Struct<{…full…}>`
++ conditional `Encoded`/`Type`) is re-derived **once per program** — N programs = N re-derivations.
+The facade materializes the named interfaces **once** at emit, so every program reads cheap literals.
+The saving therefore **scales with the number of programs / project references / parallel checkers**;
+a many-reference monorepo is the worst case for stock and the best case for the facade.
+
 ---
 
 ## How
