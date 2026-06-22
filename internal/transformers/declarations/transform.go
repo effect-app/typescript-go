@@ -2865,6 +2865,49 @@ func isEffectSchemaStructNestedEncodedInterface(statement *ast.Node) bool {
 		typeArguments.Nodes[0].Kind == ast.KindTypeQuery
 }
 
+func isEffectSchemaStructNestedEncodedInterfaceForModel(statement *ast.Node, modelName string) bool {
+	if !isEffectSchemaStructNestedEncodedInterface(statement) {
+		return false
+	}
+	typeQuery := statement.AsInterfaceDeclaration().HeritageClauses.Nodes[0].AsHeritageClause().Types.Nodes[0].AsExpressionWithTypeArguments().TypeArguments.Nodes[0]
+	exprName := typeQuery.AsTypeQueryNode().ExprName
+	return exprName != nil && ast.IsIdentifier(exprName) && exprName.Text() == modelName
+}
+
+func (tx *DeclarationTransformer) expressionToEntityName(expression *ast.Node) *ast.Node {
+	if ast.IsIdentifier(expression) {
+		return expression
+	}
+	if ast.IsPropertyAccessExpression(expression) && expression.Name() != nil {
+		left := tx.expressionToEntityName(expression.AsPropertyAccessExpression().Expression)
+		if left != nil {
+			return tx.Factory().NewQualifiedName(left, expression.Name())
+		}
+	}
+	return nil
+}
+
+func (tx *DeclarationTransformer) materializeSchemaNestedEncoded(encoded *ast.Node) *ast.Node {
+	heritageType := encoded.AsInterfaceDeclaration().HeritageClauses.Nodes[0].AsHeritageClause().Types.Nodes[0]
+	typeName := tx.expressionToEntityName(heritageType.AsExpressionWithTypeArguments().Expression)
+	if typeName == nil {
+		return nil
+	}
+	typeNode := tx.Factory().NewTypeReferenceNode(typeName, heritageType.AsExpressionWithTypeArguments().TypeArguments)
+	return tx.resolver.CreateTypeLiteralOfTypeNode(tx.EmitContext(), typeNode, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaMaterializedEncodedDeclaration(encoded *ast.Node, classDeclaration *ast.Node) *ast.Node {
+	encodedType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeLiteralOfClassStaticProperty(tx.EmitContext(), classDeclaration, "Encoded", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if encodedType == nil {
+		encodedType = tx.materializeSchemaNestedEncoded(encoded)
+	}
+	if encodedType == nil || !ast.IsTypeLiteralNode(encodedType) {
+		return nil
+	}
+	return tx.Factory().NewInterfaceDeclaration(encoded.Modifiers(), encoded.Name(), encoded.AsInterfaceDeclaration().TypeParameters, nil, tx.Factory().NewNodeList(encodedType.AsTypeLiteralNode().Members.Nodes))
+}
+
 func isEffectSchemaEncodedInterface(statement *ast.Node) bool {
 	return ast.IsInterfaceDeclaration(statement) && statement.Name() != nil && statement.Name().Text() == "Encoded"
 }
@@ -2914,14 +2957,27 @@ func (tx *DeclarationTransformer) updateEffectSchemaNamespaceDeclaration(namespa
 	if body == nil || body.Kind != ast.KindModuleBlock {
 		return nil
 	}
+	replacedEncoded := false
 	existing := map[string]bool{}
 	kept := make([]*ast.Node, 0, len(body.AsModuleBlock().Statements.Nodes))
 	for _, statement := range body.AsModuleBlock().Statements.Nodes {
-		if (ast.IsInterfaceDeclaration(statement) || ast.IsTypeAliasDeclaration(statement)) && statement.Name() != nil && statement.Name().Text() != "Encoded" {
+		if (ast.IsInterfaceDeclaration(statement) || ast.IsTypeAliasDeclaration(statement)) && statement.Name() != nil {
 			name := statement.Name().Text()
-			existing[name] = true
-			if name == "Make" || name == "DecodingServices" || name == "EncodingServices" {
-				continue
+			if name == "Encoded" {
+				var encodedDeclaration *ast.Node
+				if isEffectSchemaStructNestedEncodedInterfaceForModel(statement, moduleDeclarationIdentifierName(namespace)) {
+					encodedDeclaration = tx.createEffectSchemaMaterializedEncodedDeclaration(statement, classDeclaration)
+				}
+				if encodedDeclaration != nil {
+					kept = append(kept, encodedDeclaration)
+					replacedEncoded = true
+					continue
+				}
+			} else {
+				existing[name] = true
+				if name == "Make" || name == "DecodingServices" || name == "EncodingServices" {
+					continue
+				}
 			}
 		}
 		kept = append(kept, statement)
@@ -2937,7 +2993,7 @@ func (tx *DeclarationTransformer) updateEffectSchemaNamespaceDeclaration(namespa
 	if encodingServices := tx.createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices"); encodingServices != nil {
 		additions = append(additions, encodingServices)
 	}
-	if len(additions) == 0 && len(existing) == 0 {
+	if !replacedEncoded && len(additions) == 0 && len(existing) == 0 {
 		return nil
 	}
 

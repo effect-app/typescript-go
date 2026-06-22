@@ -1089,6 +1089,21 @@ func (r *EmitResolver) CreateTypeLiteralOfClassDeclaration(emitContext *printer.
 	return r.createTypeLiteralOfType(emitContext, r.checker.getDeclaredTypeOfSymbol(symbol), enclosingDeclaration, flags, internalFlags, tracker)
 }
 
+func (r *EmitResolver) CreateTypeLiteralOfClassStaticProperty(emitContext *printer.EmitContext, declaration *ast.Node, propertyName string, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil {
+		return nil
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	propertyType := r.getTypeOfClassSchemaProperty(declaration, propertyName)
+	if propertyType == nil {
+		return nil
+	}
+	return r.createTypeLiteralOfType(emitContext, propertyType, enclosingDeclaration, flags, internalFlags, tracker)
+}
+
 func (r *EmitResolver) CreateMakeTypeOfClassDeclaration(emitContext *printer.EmitContext, declaration *ast.Node, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
 	declaration = emitContext.ParseNode(declaration)
 	if declaration == nil {
