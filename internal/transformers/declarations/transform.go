@@ -3159,9 +3159,9 @@ func (tx *DeclarationTransformer) createEffectSchemaFacadeTypeReference(modelNam
 
 func (tx *DeclarationTransformer) createEffectSchemaStaticMembers(classDeclaration *ast.Node) []*ast.Node {
 	members := []*ast.Node{}
-	// `identifier` is an `S.Class` static (the facade base is `S.Bottom`, which lacks it);
-	// carry it so the faceted class type stays equal to the stock `EnhancedClass` one.
-	tx.addSchemaStaticMember(&members, classDeclaration, "identifier", true)
+	// NOTE: `identifier` (generic `string`) is intentionally NOT emitted here — it lives on the
+	// facade interfaces (OpaqueFacade/OpaqueClassFacade/OpaqueErrorFacadeClass) in effect-app.
+	// Only per-model, precisely-typed statics belong here.
 	tx.addSchemaStaticMember(&members, classDeclaration, "fields", true)
 	tx.addSchemaStaticMember(&members, classDeclaration, "mapFields", false)
 	tx.addSchemaStaticMember(&members, classDeclaration, "to", true)
