@@ -370,6 +370,11 @@ Create sourcemaps for d.ts files.
 type: boolean
 default: false
 
+[94m--disableEffectAppDtsFacades[39m
+Disable effect-app declaration facade emit.
+type: boolean
+default: false
+
 [94m--downlevelIteration[39m
 Emit more compliant, but verbose and less performant JavaScript for iteration.
 type: boolean

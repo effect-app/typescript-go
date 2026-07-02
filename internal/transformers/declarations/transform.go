@@ -14,6 +14,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/jsnum"
 	"github.com/microsoft/typescript-go/internal/modulespecifiers"
 	"github.com/microsoft/typescript-go/internal/nodebuilder"
+	"github.com/microsoft/typescript-go/internal/packagejson"
 	"github.com/microsoft/typescript-go/internal/printer"
 	"github.com/microsoft/typescript-go/internal/scanner"
 	"github.com/microsoft/typescript-go/internal/transformers"
@@ -2287,6 +2288,9 @@ func (tx *DeclarationTransformer) createEffectSchemaSourceFileDeclarations(state
 	if statements == nil || tx.state.currentSourceFile == nil {
 		return statements
 	}
+	if !tx.canEmitEffectAppDtsFacades() {
+		return statements
+	}
 
 	modelNames := map[string]bool{}
 	existingNamespaces := map[string]bool{}
@@ -2467,6 +2471,34 @@ func (tx *DeclarationTransformer) createEffectSchemaSourceFileDeclarations(state
 		return statements
 	}
 	return tx.Factory().NewNodeList(next)
+}
+
+func (tx *DeclarationTransformer) canEmitEffectAppDtsFacades() bool {
+	if tx.compilerOptions.DisableEffectAppDtsFacades.IsTrue() || tx.state.currentSourceFile == nil {
+		return false
+	}
+	dir := tspath.GetDirectoryPath(tx.state.currentSourceFile.FileName())
+	packageDir := tx.host.GetNearestAncestorDirectoryWithPackageJson(dir)
+	if packageDir == "" {
+		return false
+	}
+	info := tx.host.GetPackageJsonInfo(tspath.CombinePaths(packageDir, "package.json"))
+	return packageJsonReferencesEffectApp(info.GetContents())
+}
+
+func packageJsonReferencesEffectApp(contents *packagejson.PackageJson) bool {
+	if contents == nil {
+		return false
+	}
+	if contents.HasDependency("effect-app") {
+		return true
+	}
+	found := false
+	contents.RangeDependencies(func(name, version, dependencyField string) bool {
+		found = strings.HasPrefix(name, "@effect-app/")
+		return !found
+	})
+	return found
 }
 
 func (tx *DeclarationTransformer) getEffectSchemaOriginalClasses() map[string]*ast.Node {

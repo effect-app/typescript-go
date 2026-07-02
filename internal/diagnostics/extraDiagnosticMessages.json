@@ -39,6 +39,10 @@
         "category": "Message",
         "code": 100009
     },
+    "Disable effect-app declaration facade emit.": {
+        "category": "Message",
+        "code": 100010
+    },
     "Non-relative paths are not allowed. Did you forget a leading './'?": {
         "category": "Error",
         "code": 5090

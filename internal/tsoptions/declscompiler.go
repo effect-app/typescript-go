@@ -203,6 +203,14 @@ var commonOptionsWithBuild = []*CommandLineOption{
 		DefaultValueDescription:  false,
 	},
 	{
+		Name:                    "disableEffectAppDtsFacades",
+		Kind:                    CommandLineOptionTypeBoolean,
+		Category:                diagnostics.Emit,
+		Description:             diagnostics.Disable_effect_app_declaration_facade_emit,
+		DefaultValueDescription: false,
+		AffectsEmit:             true,
+	},
+	{
 		Name:                       "assumeChangesOnlyAffectDirectDependencies",
 		Kind:                       CommandLineOptionTypeBoolean,
 		AffectsSemanticDiagnostics: true,

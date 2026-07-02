@@ -40,6 +40,11 @@ Facade types live in **effect-app** (`>= 4.0.0-beta.279`). Exact interfaces (eff
 - [`EnhancedClass`](https://github.com/effect-app/libs/blob/f74ba9e6b6805010ec2ff54dd7db119209ea5521/packages/effect-app/src/Schema/Class.ts#L17) (stock class base we rewrite away)
 - [effect-app `Struct`](https://github.com/effect-app/libs/blob/f74ba9e6b6805010ec2ff54dd7db119209ea5521/packages/effect-app/src/Schema.ts#L204) (base `StructFacade` extends — effect-app's own, not effect core's)
 
+Activation guard: the transform only runs for source files whose nearest `package.json` references
+`effect-app` or an `@effect-app/*` package. Projects that only use `effect` keep stock declaration
+emit and never reference effect-app-only `S.*Facade` names. It can also be disabled explicitly with
+`--disableEffectAppDtsFacades` or `"disableEffectAppDtsFacades": true`.
+
 ---
 
 ## Why
