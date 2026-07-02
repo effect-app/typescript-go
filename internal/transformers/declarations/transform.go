@@ -5,6 +5,7 @@ import (
 	"iter"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/collections"
@@ -25,6 +26,8 @@ type ReferencedFilePair struct {
 	file *ast.SourceFile
 	ref  *ast.FileReference
 }
+
+var effectAppPackageJsonDependencyCache sync.Map
 
 type OutputPaths interface {
 	DeclarationFilePath() string
@@ -2490,7 +2493,11 @@ func packageJsonReferencesEffectApp(contents *packagejson.PackageJson) bool {
 	if contents == nil {
 		return false
 	}
+	if cached, ok := effectAppPackageJsonDependencyCache.Load(contents); ok {
+		return cached.(bool)
+	}
 	if contents.HasDependency("effect-app") {
+		effectAppPackageJsonDependencyCache.Store(contents, true)
 		return true
 	}
 	found := false
@@ -2498,6 +2505,7 @@ func packageJsonReferencesEffectApp(contents *packagejson.PackageJson) bool {
 		found = strings.HasPrefix(name, "@effect-app/")
 		return !found
 	})
+	effectAppPackageJsonDependencyCache.Store(contents, found)
 	return found
 }
 
