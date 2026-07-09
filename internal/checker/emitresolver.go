@@ -12,6 +12,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/jsnum"
 	"github.com/microsoft/typescript-go/internal/nodebuilder"
 	"github.com/microsoft/typescript-go/internal/printer"
+	"github.com/microsoft/typescript-go/internal/scanner"
 )
 
 var _ printer.EmitResolver = (*EmitResolver)(nil)
@@ -1048,6 +1049,244 @@ func (r *EmitResolver) CreateTypeOfExpression(emitContext *printer.EmitContext, 
 	defer r.checkerMu.Unlock()
 	requestNodeBuilder := NewNodeBuilder(r.checker, emitContext) // TODO: cache per-context
 	return requestNodeBuilder.SerializeTypeForExpression(expression, enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals, internalFlags, tracker)
+}
+
+func (r *EmitResolver) CreateTypeOfTypeNode(emitContext *printer.EmitContext, typeNode *ast.Node, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	typeNode = emitContext.ParseNode(typeNode)
+	if typeNode == nil {
+		return emitContext.Factory.NewKeywordTypeNode(ast.KindAnyKeyword)
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	requestNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+	return requestNodeBuilder.TypeToTypeNode(r.checker.getTypeFromTypeNode(typeNode), enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals, internalFlags, tracker)
+}
+
+func (r *EmitResolver) CreateTypeLiteralOfTypeNode(emitContext *printer.EmitContext, typeNode *ast.Node, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	typeNode = emitContext.ParseNode(typeNode)
+	if typeNode == nil {
+		return nil
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	return r.createTypeLiteralOfType(emitContext, r.checker.getTypeFromTypeNode(typeNode), enclosingDeclaration, flags, internalFlags, tracker)
+}
+
+func (r *EmitResolver) CreateTypeLiteralOfClassDeclaration(emitContext *printer.EmitContext, declaration *ast.Node, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil {
+		return nil
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	if schemaType := r.getTypeOfClassSchemaProperty(declaration, "Type"); schemaType != nil {
+		return r.createTypeLiteralOfType(emitContext, schemaType, enclosingDeclaration, flags, internalFlags, tracker)
+	}
+	symbol := r.checker.getSymbolOfDeclaration(declaration)
+	if symbol == nil {
+		return nil
+	}
+	return r.createTypeLiteralOfType(emitContext, r.checker.getDeclaredTypeOfSymbol(symbol), enclosingDeclaration, flags, internalFlags, tracker)
+}
+
+func (r *EmitResolver) CreateTypeLiteralOfClassStaticProperty(emitContext *printer.EmitContext, declaration *ast.Node, propertyName string, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil {
+		return nil
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	propertyType := r.getTypeOfClassSchemaProperty(declaration, propertyName)
+	if propertyType == nil {
+		return nil
+	}
+	return r.createTypeLiteralOfType(emitContext, propertyType, enclosingDeclaration, flags, internalFlags, tracker)
+}
+
+func (r *EmitResolver) CreateMakeTypeOfClassDeclaration(emitContext *printer.EmitContext, declaration *ast.Node, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil {
+		return nil
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	makeType := r.getTypeOfClassSchemaProperty(declaration, "~type.make.in")
+	typeType := r.getTypeOfClassSchemaProperty(declaration, "Type")
+	if makeType == nil || typeType == nil {
+		return nil
+	}
+	return r.createMakeTypeOfTypes(emitContext, makeType, typeType, enclosingDeclaration, flags, internalFlags, tracker)
+}
+
+func (r *EmitResolver) CreateTypeOfClassStaticProperty(emitContext *printer.EmitContext, declaration *ast.Node, propertyName string, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil {
+		return nil
+	}
+
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	propertyType := r.getTypeOfClassSchemaProperty(declaration, propertyName)
+	if propertyType == nil {
+		propertyType = r.getTypeOfClassStaticProperty(declaration, propertyName)
+	}
+	if propertyType == nil {
+		return nil
+	}
+	requestNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+	return requestNodeBuilder.TypeToTypeNode(propertyType, enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals|nodebuilder.FlagsUseFullyQualifiedType, internalFlags, tracker)
+}
+
+func (r *EmitResolver) getTypeOfClassSchemaProperty(declaration *ast.Node, propertyName string) *Type {
+	schemaExpression := getClassSchemaExpression(declaration)
+	if schemaExpression == nil {
+		return nil
+	}
+	return r.getTypeOfSchemaExpressionProperty(schemaExpression, propertyName)
+}
+
+func (r *EmitResolver) getTypeOfSchemaExpressionProperty(schemaExpression *ast.Node, propertyName string) *Type {
+	schemaType := r.checker.getTypeOfExpression(schemaExpression)
+	property := r.checker.getPropertyOfType(schemaType, propertyName)
+	if property == nil {
+		return nil
+	}
+	return r.checker.GetTypeOfSymbolAtLocation(property, schemaExpression)
+}
+
+// Like CreateTypeOfClassStaticProperty, but for a `const X = S.Struct(...)` schema value:
+// reads propertyName (Encoded / Type / ~type.make.in / DecodingServices / ...) off the type
+// of the const's initializer and serializes the resolved type. Serializing the resolved type
+// keeps `never` as `never` and never synthesizes references that could fail to resolve.
+func (r *EmitResolver) CreateTypeOfStructSchemaProperty(emitContext *printer.EmitContext, declaration *ast.Node, propertyName string, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	declaration = emitContext.ParseNode(declaration)
+	if declaration == nil || !ast.IsVariableDeclaration(declaration) || declaration.AsVariableDeclaration().Initializer == nil {
+		return nil
+	}
+	r.checkerMu.Lock()
+	defer r.checkerMu.Unlock()
+	propertyType := r.getTypeOfSchemaExpressionProperty(declaration.AsVariableDeclaration().Initializer, propertyName)
+	if propertyType == nil {
+		return nil
+	}
+	structNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+	return structNodeBuilder.TypeToTypeNode(propertyType, enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals|nodebuilder.FlagsUseFullyQualifiedType, internalFlags, tracker)
+}
+
+func getClassSchemaExpression(declaration *ast.Node) *ast.Node {
+	if declaration == nil || !ast.IsClassDeclaration(declaration) || declaration.AsClassDeclaration().HeritageClauses == nil || len(declaration.AsClassDeclaration().HeritageClauses.Nodes) == 0 {
+		return nil
+	}
+	heritageClause := declaration.AsClassDeclaration().HeritageClauses.Nodes[0]
+	if heritageClause == nil || len(heritageClause.AsHeritageClause().Types.Nodes) == 0 {
+		return nil
+	}
+	expression := heritageClause.AsHeritageClause().Types.Nodes[0].AsExpressionWithTypeArguments().Expression
+	if expression == nil || !ast.IsCallExpression(expression) || expression.AsCallExpression().Arguments == nil || len(expression.AsCallExpression().Arguments.Nodes) == 0 {
+		return nil
+	}
+	return expression.AsCallExpression().Arguments.Nodes[0]
+}
+
+func (r *EmitResolver) getTypeOfClassStaticProperty(declaration *ast.Node, propertyName string) *Type {
+	symbol := r.checker.getSymbolOfDeclaration(declaration)
+	if symbol == nil {
+		return nil
+	}
+	staticType := r.checker.getTypeOfSymbol(symbol)
+	property := r.checker.getPropertyOfType(staticType, propertyName)
+	if property == nil {
+		return nil
+	}
+	return r.checker.GetTypeOfSymbolAtLocation(property, declaration)
+}
+
+func (r *EmitResolver) createTypeLiteralOfType(emitContext *printer.EmitContext, typ *Type, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	requestNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+	members := core.Map(r.checker.getPropertiesOfType(typ), func(property *ast.Symbol) *ast.Node {
+		propertyTypeNode := requestNodeBuilder.TypeToTypeNode(r.checker.getTypeOfSymbol(property), enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals|nodebuilder.FlagsUseFullyQualifiedType, internalFlags, tracker)
+		if propertyTypeNode == nil {
+			propertyTypeNode = emitContext.Factory.NewKeywordTypeNode(ast.KindAnyKeyword)
+		}
+		var optionalToken *ast.Node
+		if property.Flags&ast.SymbolFlagsOptional != 0 {
+			optionalToken = emitContext.Factory.NewToken(ast.KindQuestionToken)
+		}
+		return emitContext.Factory.NewPropertySignatureDeclaration(
+			emitContext.Factory.NewModifierList([]*ast.Node{emitContext.Factory.NewModifier(ast.KindReadonlyKeyword)}),
+			createPropertyName(emitContext, property.Name),
+			optionalToken,
+			propertyTypeNode,
+			nil,
+		)
+	})
+	return emitContext.Factory.NewTypeLiteralNode(emitContext.Factory.NewNodeList(members))
+}
+
+func (r *EmitResolver) createMakeTypeOfTypes(emitContext *printer.EmitContext, makeType *Type, typeType *Type, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) *ast.Node {
+	isVoidish := func(typ *Type) bool { return typ.flags&(TypeFlagsVoid|TypeFlagsUndefined) != 0 }
+	var makeTypes []*Type
+	if makeType.flags&TypeFlagsUnion != 0 {
+		makeTypes = makeType.AsUnionType().types
+	}
+	hasVoid := core.Some(makeTypes, isVoidish)
+	objectMakeType := makeType
+	if makeTypes != nil {
+		for _, typ := range makeTypes {
+			if len(r.checker.getPropertiesOfType(typ)) > 0 {
+				objectMakeType = typ
+				break
+			}
+		}
+	}
+	makeProperties := r.checker.getPropertiesOfType(objectMakeType)
+	if len(makeProperties) == 0 {
+		requestNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+		return requestNodeBuilder.TypeToTypeNode(makeType, enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals|nodebuilder.FlagsUseFullyQualifiedType, internalFlags, tracker)
+	}
+	typeProperties := make(map[string]*ast.Symbol)
+	for _, property := range r.checker.getPropertiesOfType(typeType) {
+		typeProperties[property.Name] = property
+	}
+	requestNodeBuilder := NewNodeBuilder(r.checker, emitContext)
+	members := core.Map(makeProperties, func(property *ast.Symbol) *ast.Node {
+		source := property
+		if typeProperty := typeProperties[property.Name]; typeProperty != nil {
+			source = typeProperty
+		}
+		propertyTypeNode := requestNodeBuilder.TypeToTypeNode(r.checker.getTypeOfSymbol(source), enclosingDeclaration, flags|nodebuilder.FlagsMultilineObjectLiterals|nodebuilder.FlagsUseFullyQualifiedType, internalFlags, tracker)
+		if propertyTypeNode == nil {
+			propertyTypeNode = emitContext.Factory.NewKeywordTypeNode(ast.KindAnyKeyword)
+		}
+		var optionalToken *ast.Node
+		if property.Flags&ast.SymbolFlagsOptional != 0 {
+			optionalToken = emitContext.Factory.NewToken(ast.KindQuestionToken)
+		}
+		return emitContext.Factory.NewPropertySignatureDeclaration(
+			emitContext.Factory.NewModifierList([]*ast.Node{emitContext.Factory.NewModifier(ast.KindReadonlyKeyword)}),
+			createPropertyName(emitContext, property.Name),
+			optionalToken,
+			propertyTypeNode,
+			nil,
+		)
+	})
+	literal := emitContext.Factory.NewTypeLiteralNode(emitContext.Factory.NewNodeList(members))
+	if hasVoid {
+		return emitContext.Factory.NewUnionTypeNode(emitContext.Factory.NewNodeList([]*ast.Node{literal, emitContext.Factory.NewKeywordTypeNode(ast.KindVoidKeyword)}))
+	}
+	return literal
+}
+
+func createPropertyName(emitContext *printer.EmitContext, name string) *ast.Node {
+	if scanner.IsIdentifierText(name, core.LanguageVariantStandard) {
+		return emitContext.Factory.NewIdentifier(name)
+	}
+	return emitContext.Factory.NewStringLiteral(name, ast.TokenFlagsNone)
 }
 
 func (r *EmitResolver) CreateLateBoundIndexSignatures(emitContext *printer.EmitContext, container *ast.Node, enclosingDeclaration *ast.Node, flags nodebuilder.Flags, internalFlags nodebuilder.InternalFlags, tracker nodebuilder.SymbolTracker) []*ast.Node {

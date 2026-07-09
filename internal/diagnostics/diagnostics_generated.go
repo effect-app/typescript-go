@@ -4292,6 +4292,8 @@ var X_1_implementation = &Message{code: 100008, category: CategoryMessage, key: 
 
 var Set_the_number_of_projects_to_build_concurrently = &Message{code: 100009, category: CategoryMessage, key: "Set_the_number_of_projects_to_build_concurrently_100009", text: "Set the number of projects to build concurrently."}
 
+var Disable_effect_app_declaration_facade_emit = &Message{code: 100010, category: CategoryMessage, key: "Disable_effect_app_declaration_facade_emit_100010", text: "Disable effect-app declaration facade emit."}
+
 var Deduplicate_packages_with_the_same_name_and_version = &Message{code: 100011, category: CategoryMessage, key: "Deduplicate_packages_with_the_same_name_and_version_100011", text: "Deduplicate packages with the same name and version."}
 
 var Loading = &Message{code: 100012, category: CategoryMessage, key: "Loading_100012", text: "Loading"}
@@ -8602,6 +8604,8 @@ func keyToMessage(key Key) *Message {
 		return X_1_implementation
 	case "Set_the_number_of_projects_to_build_concurrently_100009":
 		return Set_the_number_of_projects_to_build_concurrently
+	case "Disable_effect_app_declaration_facade_emit_100010":
+		return Disable_effect_app_declaration_facade_emit
 	case "Deduplicate_packages_with_the_same_name_and_version_100011":
 		return Deduplicate_packages_with_the_same_name_and_version
 	case "Loading_100012":

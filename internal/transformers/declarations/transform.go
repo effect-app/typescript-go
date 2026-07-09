@@ -5,6 +5,7 @@ import (
 	"iter"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/microsoft/typescript-go/internal/ast"
 	"github.com/microsoft/typescript-go/internal/collections"
@@ -14,6 +15,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/jsnum"
 	"github.com/microsoft/typescript-go/internal/modulespecifiers"
 	"github.com/microsoft/typescript-go/internal/nodebuilder"
+	"github.com/microsoft/typescript-go/internal/packagejson"
 	"github.com/microsoft/typescript-go/internal/printer"
 	"github.com/microsoft/typescript-go/internal/scanner"
 	"github.com/microsoft/typescript-go/internal/transformers"
@@ -24,6 +26,8 @@ type ReferencedFilePair struct {
 	file *ast.SourceFile
 	ref  *ast.FileReference
 }
+
+var effectAppPackageJsonDependencyCache sync.Map
 
 type OutputPaths interface {
 	DeclarationFilePath() string
@@ -353,6 +357,7 @@ func (tx *DeclarationTransformer) transformSourceFile(node *ast.SourceFile) *ast
 	statements := tx.Visitor().VisitNodes(node.Statements)
 	combinedStatements = tx.transformAndReplaceLatePaintedStatements(statements)
 	combinedStatements = tx.appendCjsExports(combinedStatements)
+	combinedStatements = tx.createEffectSchemaSourceFileDeclarations(combinedStatements)
 	combinedStatements.Loc = statements.Loc // setTextRange
 	if ast.IsExternalOrCommonJSModule(node) {
 		if ast.IsInJSFile(node.AsNode()) {
@@ -2279,6 +2284,1188 @@ func (tx *DeclarationTransformer) transformEnumDeclaration(input *ast.EnumDeclar
 			return result
 		})),
 	)
+}
+
+type effectSchemaRequestBaseInfo struct {
+	modelName string
+	brand     *ast.Node
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaSourceFileDeclarations(statements *ast.StatementList) *ast.StatementList {
+	if statements == nil || tx.state.currentSourceFile == nil {
+		return statements
+	}
+	if !tx.canEmitEffectAppDtsFacades() {
+		return statements
+	}
+
+	modelNames := map[string]bool{}
+	existingNamespaces := map[string]bool{}
+	classes := map[string]*ast.Node{}
+	schemaClasses := tx.getEffectSchemaOriginalClasses()
+
+	for _, statement := range statements.Nodes {
+		if className := getEffectSchemaClassName(statement); className != "" && ast.IsClassDeclaration(statement) {
+			classes[className] = statement
+		}
+	}
+
+	for _, statement := range statements.Nodes {
+		if isEffectSchemaModelNamespace(statement) || isEffectSchemaMaterializedModelNamespace(statement, classes) {
+			name := moduleDeclarationIdentifierName(statement)
+			if name != "" && schemaClasses[name] != nil {
+				modelNames[name] = true
+				existingNamespaces[name] = true
+			}
+		}
+	}
+
+	requestBaseInfos := map[string]effectSchemaRequestBaseInfo{}
+	for _, statement := range statements.Nodes {
+		if info, ok := getEffectSchemaRequestBaseInfo(statement); ok && classes[info.modelName] != nil && schemaClasses[info.modelName] == nil {
+			requestBaseInfos[info.modelName] = info
+		}
+	}
+
+	for className, classDeclaration := range schemaClasses {
+		if !existingNamespaces[className] && tx.canCreateEffectSchemaGeneratedNamespace(classDeclaration) {
+			modelNames[className] = true
+		}
+	}
+
+	// Top-level `const X = S.Struct(...)` / `S.TaggedStruct(...)` schema values. Faceted on
+	// the const itself (it is a value, not a class): the giant `S.Struct<{...}>` annotation
+	// becomes a compact `StructFacade<...>` plus a generated `interface X` (decoded Self) and
+	// a type-only `declare namespace X`.
+	structModelNames := map[string]bool{}
+	for name := range tx.getEffectSchemaOriginalStructs() {
+		if modelNames[name] {
+			continue
+		}
+		if _, ok := requestBaseInfos[name]; ok {
+			continue
+		}
+		if hasTopLevelInterface(statements, name) || hasTopLevelNamespace(statements, name) {
+			continue
+		}
+		if tx.canCreateEffectSchemaGeneratedStructNamespace(name) {
+			structModelNames[name] = true
+		}
+	}
+
+	if len(modelNames) == 0 && len(requestBaseInfos) == 0 && len(structModelNames) == 0 {
+		return statements
+	}
+
+	changed := false
+	next := make([]*ast.Node, 0, len(statements.Nodes))
+	for _, statement := range statements.Nodes {
+		baseModelName := getEffectSchemaBaseModelName(statement)
+		if baseModelName != "" && modelNames[baseModelName] {
+			classDeclaration := schemaClasses[baseModelName]
+			if classDeclaration == nil {
+				classDeclaration = classes[baseModelName]
+			}
+			if classDeclaration != nil {
+				if updated := tx.updateEffectSchemaBaseDeclaration(statement, baseModelName, classDeclaration, needsEffectSchemaIntermediateClass(classDeclaration)); updated != nil {
+					changed = true
+					next = append(next, updated)
+					continue
+				}
+			}
+		}
+
+		if requestBaseInfo, ok := requestBaseInfos[baseModelName]; ok {
+			if updated := tx.updateEffectSchemaRequestBaseDeclaration(statement, requestBaseInfo); updated != nil {
+				changed = true
+				next = append(next, updated)
+				continue
+			}
+		}
+
+		if isEffectSchemaModelNamespace(statement) || isEffectSchemaMaterializedModelNamespace(statement, classes) {
+			name := moduleDeclarationIdentifierName(statement)
+			classDeclaration := schemaClasses[name]
+			if classDeclaration == nil {
+				classDeclaration = classes[name]
+			}
+			if classDeclaration != nil {
+				if updated := tx.updateEffectSchemaNamespaceDeclaration(statement, classDeclaration); updated != nil {
+					changed = true
+					next = append(next, updated)
+					continue
+				}
+			}
+		}
+
+		className := getEffectSchemaClassName(statement)
+		if requestBaseInfos[className].modelName != "" {
+			classDeclaration := statement
+			var typeInterface *ast.Node
+			if !hasTopLevelInterface(statements, className) {
+				typeInterface = tx.createEffectSchemaTypeInterface(classDeclaration)
+			}
+			var namespace *ast.Node
+			if !hasTopLevelNamespace(statements, className) {
+				namespace = tx.createEffectSchemaGeneratedNamespaceDeclaration(className, classDeclaration)
+			}
+			if typeInterface != nil || namespace != nil {
+				changed = true
+				next = append(next, statement)
+				if typeInterface != nil {
+					next = append(next, typeInterface)
+				}
+				if namespace != nil {
+					next = append(next, namespace)
+				}
+				continue
+			}
+		}
+
+		if className != "" && modelNames[className] {
+			classDeclaration := schemaClasses[className]
+			if classDeclaration == nil {
+				classDeclaration = statement
+			}
+			usesIntermediate := needsEffectSchemaIntermediateClass(classDeclaration)
+			updatedClass := statement
+			if usesIntermediate {
+				updatedClass = tx.updateEffectSchemaClassDeclaration(statement, className)
+			}
+			var typeInterface *ast.Node
+			if !hasTopLevelInterface(statements, className) {
+				typeInterface = tx.createEffectSchemaTypeInterface(classDeclaration)
+			}
+			var namespace *ast.Node
+			if !existingNamespaces[className] {
+				namespace = tx.createEffectSchemaGeneratedNamespaceDeclaration(className, classDeclaration)
+			}
+			if updatedClass != statement || typeInterface != nil || namespace != nil {
+				changed = true
+				if usesIntermediate {
+					next = append(next, tx.createEffectSchemaIntermediateClass(className))
+				}
+				next = append(next, updatedClass)
+				if typeInterface != nil {
+					next = append(next, typeInterface)
+				}
+				if namespace != nil {
+					existingNamespaces[className] = true
+					next = append(next, namespace)
+				}
+				continue
+			}
+		}
+
+		if structName := getEffectSchemaStructVariableName(statement); structName != "" && structModelNames[structName] {
+			if declarations := tx.createEffectSchemaStructDeclarations(statement, structName); declarations != nil {
+				changed = true
+				next = append(next, declarations...)
+				continue
+			}
+		}
+
+		if isEffectSchemaStructCompanionTypeAlias(statement, structModelNames) {
+			// Dropped — replaced by the generated `interface X`.
+			changed = true
+			continue
+		}
+
+		next = append(next, statement)
+	}
+
+	if !changed {
+		return statements
+	}
+	return tx.Factory().NewNodeList(next)
+}
+
+func (tx *DeclarationTransformer) canEmitEffectAppDtsFacades() bool {
+	if tx.compilerOptions.DisableEffectAppDtsFacades.IsTrue() || tx.state.currentSourceFile == nil {
+		return false
+	}
+	dir := tspath.GetDirectoryPath(tx.state.currentSourceFile.FileName())
+	packageDir := tx.host.GetNearestAncestorDirectoryWithPackageJson(dir)
+	if packageDir == "" {
+		return false
+	}
+	info := tx.host.GetPackageJsonInfo(tspath.CombinePaths(packageDir, "package.json"))
+	return packageJsonReferencesEffectApp(info.GetContents())
+}
+
+func packageJsonReferencesEffectApp(contents *packagejson.PackageJson) bool {
+	if contents == nil {
+		return false
+	}
+	if cached, ok := effectAppPackageJsonDependencyCache.Load(contents); ok {
+		return cached.(bool)
+	}
+	if contents.HasDependency("effect-app") {
+		effectAppPackageJsonDependencyCache.Store(contents, true)
+		return true
+	}
+	found := false
+	contents.RangeDependencies(func(name, version, dependencyField string) bool {
+		found = strings.HasPrefix(name, "@effect-app/")
+		return !found
+	})
+	effectAppPackageJsonDependencyCache.Store(contents, found)
+	return found
+}
+
+func (tx *DeclarationTransformer) getEffectSchemaOriginalClasses() map[string]*ast.Node {
+	classes := map[string]*ast.Node{}
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		if ast.IsClassDeclaration(statement) && statement.Name() != nil && hasEffectSchemaOpaqueHeritage(statement) {
+			classes[statement.Name().Text()] = statement
+		}
+	}
+	return classes
+}
+
+// --- Struct/TaggedStruct const faceting ---
+
+func (tx *DeclarationTransformer) getEffectSchemaOriginalStructs() map[string]bool {
+	structs := map[string]bool{}
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		name := getEffectSchemaStructVariableName(statement)
+		if name == "" {
+			continue
+		}
+		decl := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes[0]
+		if decl.AsVariableDeclaration().Initializer != nil && isEffectSchemaStructInitializer(decl.AsVariableDeclaration().Initializer) {
+			structs[name] = true
+		}
+	}
+	return structs
+}
+
+func isEffectSchemaStructInitializer(expression *ast.Node) bool {
+	if !ast.IsCallExpression(expression) {
+		return false
+	}
+	callee := expression.AsCallExpression().Expression
+	if !ast.IsPropertyAccessExpression(callee) || callee.Name() == nil {
+		return false
+	}
+	name := callee.Name().Text()
+	if name != "Struct" && name != "TaggedStruct" {
+		return false
+	}
+	left := callee.Expression()
+	return left != nil && ast.IsIdentifier(left) && (left.Text() == "S" || left.Text() == "Schema")
+}
+
+func getEffectSchemaStructVariableName(statement *ast.Node) string {
+	if !ast.IsVariableStatement(statement) || statement.AsVariableStatement().DeclarationList == nil {
+		return ""
+	}
+	declarations := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes
+	if len(declarations) != 1 || declarations[0].Name() == nil || !ast.IsIdentifier(declarations[0].Name()) {
+		return ""
+	}
+	return declarations[0].Name().Text()
+}
+
+func (tx *DeclarationTransformer) getEffectSchemaSourceStructDeclaration(modelName string) *ast.Node {
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		if getEffectSchemaStructVariableName(statement) != modelName {
+			continue
+		}
+		decl := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes[0]
+		if decl.AsVariableDeclaration().Initializer != nil && isEffectSchemaStructInitializer(decl.AsVariableDeclaration().Initializer) {
+			return decl
+		}
+	}
+	return nil
+}
+
+// Reads a property (Encoded / Type / ~type.make.in / fields / services) off the source
+// struct value's type and serializes it; `never` services stay `never`.
+func (tx *DeclarationTransformer) materializeEffectSchemaStructProperty(modelName string, propertyName string) *ast.Node {
+	declaration := tx.getEffectSchemaSourceStructDeclaration(modelName)
+	if declaration == nil {
+		return nil
+	}
+	return tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfStructSchemaProperty(tx.EmitContext(), declaration, propertyName, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+}
+
+func (tx *DeclarationTransformer) canCreateEffectSchemaGeneratedStructNamespace(modelName string) bool {
+	return tx.materializeEffectSchemaStructProperty(modelName, "Encoded") != nil
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaStructInterfaceFromProperty(modelName string, propertyName string, declaredName string) *ast.Node {
+	typeNode := tx.materializeEffectSchemaStructProperty(modelName, propertyName)
+	if typeNode == nil {
+		return nil
+	}
+	if ast.IsTypeLiteralNode(typeNode) {
+		return tx.Factory().NewInterfaceDeclaration(nil, tx.Factory().NewIdentifier(declaredName), nil, nil, tx.Factory().NewNodeList(typeNode.AsTypeLiteralNode().Members.Nodes))
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier(declaredName), nil, typeNode)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaStructServiceDeclaration(modelName string, name string) *ast.Node {
+	resolved := tx.materializeEffectSchemaStructProperty(modelName, name)
+	serviceType := resolved
+	if resolved == nil || resolved.Kind == ast.KindAnyKeyword {
+		serviceType = tx.Factory().NewKeywordTypeNode(ast.KindNeverKeyword)
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier(name), nil, serviceType)
+}
+
+func structHasExportModifier(statement *ast.Node) bool {
+	return ast.HasSyntacticModifier(statement, ast.ModifierFlagsExport)
+}
+
+func (tx *DeclarationTransformer) effectSchemaStructModifiers(exported bool, includeDeclare bool) *ast.ModifierList {
+	modifiers := []*ast.Node{}
+	if exported {
+		modifiers = append(modifiers, tx.Factory().NewModifier(ast.KindExportKeyword))
+	}
+	if includeDeclare {
+		modifiers = append(modifiers, tx.Factory().NewModifier(ast.KindDeclareKeyword))
+	}
+	if len(modifiers) == 0 {
+		return nil
+	}
+	return tx.Factory().NewModifierList(modifiers)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaGeneratedStructNamespace(modelName string, exported bool) *ast.Node {
+	fields := tx.createEffectSchemaStructInterfaceFromProperty(modelName, "fields", "Fields")
+	if fields == nil {
+		return nil
+	}
+	encoded := tx.createEffectSchemaStructInterfaceFromProperty(modelName, "Encoded", "Encoded")
+	if encoded == nil {
+		return nil
+	}
+	statements := []*ast.Node{fields, encoded}
+	if makeDeclaration := tx.createEffectSchemaStructInterfaceFromProperty(modelName, "~type.make.in", "Make"); makeDeclaration != nil {
+		statements = append(statements, makeDeclaration)
+	}
+	statements = append(statements, tx.createEffectSchemaStructServiceDeclaration(modelName, "DecodingServices"))
+	statements = append(statements, tx.createEffectSchemaStructServiceDeclaration(modelName, "EncodingServices"))
+	return tx.Factory().NewModuleDeclaration(
+		tx.effectSchemaStructModifiers(exported, true),
+		ast.KindNamespaceKeyword,
+		tx.Factory().NewIdentifier(modelName),
+		tx.Factory().NewModuleBlock(tx.Factory().NewNodeList(statements)),
+	)
+}
+
+// `S.StructFacade<X, X.Encoded, X.Make, X.DecodingServices, X.EncodingServices, X.Fields>` —
+// `StructFacade` is exported from effect-app (>= 4.0.0-beta.279), so it resolves through the
+// file's own `S` (effect-app/Schema) import, exactly like `S.OpaqueFacade`. It extends
+// `S.Struct<Fields>`, so the faceted value stays Workflow-compatible.
+func (tx *DeclarationTransformer) createEffectSchemaStructFacadeType(modelName string) *ast.Node {
+	member := func(name string) *ast.Node {
+		return tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier(modelName), tx.Factory().NewIdentifier(name)), nil)
+	}
+	typeArguments := tx.Factory().NewNodeList([]*ast.Node{
+		tx.Factory().NewTypeReferenceNode(tx.Factory().NewIdentifier(modelName), nil),
+		member("Encoded"),
+		member("Make"),
+		member("DecodingServices"),
+		member("EncodingServices"),
+		member("Fields"),
+	})
+	return tx.Factory().NewTypeReferenceNode(
+		tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier("S"), tx.Factory().NewIdentifier("StructFacade")),
+		typeArguments,
+	)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaStructDeclarations(statement *ast.Node, modelName string) []*ast.Node {
+	typeNode := tx.materializeEffectSchemaStructProperty(modelName, "Type")
+	if typeNode == nil || !ast.IsTypeLiteralNode(typeNode) {
+		return nil
+	}
+	namespace := tx.createEffectSchemaGeneratedStructNamespace(modelName, structHasExportModifier(statement))
+	if namespace == nil {
+		return nil
+	}
+	exported := structHasExportModifier(statement)
+	declaration := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes[0]
+	updatedDeclaration := tx.Factory().UpdateVariableDeclaration(
+		declaration.AsVariableDeclaration(),
+		declaration.Name(),
+		declaration.AsVariableDeclaration().ExclamationToken,
+		tx.createEffectSchemaStructFacadeType(modelName),
+		declaration.AsVariableDeclaration().Initializer,
+	)
+	declarations := tx.Factory().NewNodeList([]*ast.Node{updatedDeclaration})
+	declarationList := tx.Factory().UpdateVariableDeclarationList(statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList(), declarations, statement.AsVariableStatement().DeclarationList.Flags)
+	retypedConst := tx.Factory().UpdateVariableStatement(statement.AsVariableStatement(), statement.Modifiers(), declarationList)
+	typeInterface := tx.Factory().NewInterfaceDeclaration(tx.effectSchemaStructModifiers(exported, false), tx.Factory().NewIdentifier(modelName), nil, nil, tx.Factory().NewNodeList(typeNode.AsTypeLiteralNode().Members.Nodes))
+	return []*ast.Node{retypedConst, typeInterface, namespace}
+}
+
+type generatedTypeImport struct {
+	importedName    string
+	moduleSpecifier string
+}
+
+func (tx *DeclarationTransformer) generatedTypeNamedImports() map[string]generatedTypeImport {
+	imports := map[string]generatedTypeImport{}
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		if !ast.IsImportDeclaration(statement) {
+			continue
+		}
+		decl := statement.AsImportDeclaration()
+		if decl.ModuleSpecifier == nil || !ast.IsStringLiteralLike(decl.ModuleSpecifier) || decl.ImportClause == nil || decl.ImportClause.AsImportClause().NamedBindings == nil {
+			continue
+		}
+		moduleSpecifier := decl.ModuleSpecifier.Text()
+		namedBindings := decl.ImportClause.AsImportClause().NamedBindings
+		if !ast.IsNamedImports(namedBindings) {
+			continue
+		}
+		for _, specifier := range namedBindings.AsNamedImports().Elements.Nodes {
+			importedName := specifier.Name().Text()
+			if specifier.AsImportSpecifier().PropertyName != nil {
+				importedName = specifier.AsImportSpecifier().PropertyName.Text()
+			}
+			imports[specifier.Name().Text()] = generatedTypeImport{importedName: importedName, moduleSpecifier: moduleSpecifier}
+		}
+	}
+	return imports
+}
+
+func (tx *DeclarationTransformer) generatedTypeNamespaceImports() map[string]string {
+	imports := map[string]string{}
+	for _, statement := range tx.state.currentSourceFile.Statements.Nodes {
+		if !ast.IsImportDeclaration(statement) {
+			continue
+		}
+		decl := statement.AsImportDeclaration()
+		if decl.ModuleSpecifier == nil || !ast.IsStringLiteralLike(decl.ModuleSpecifier) || decl.ImportClause == nil || decl.ImportClause.AsImportClause().NamedBindings == nil {
+			continue
+		}
+		namedBindings := decl.ImportClause.AsImportClause().NamedBindings
+		if ast.IsNamespaceImport(namedBindings) {
+			imports[decl.ModuleSpecifier.Text()] = namedBindings.Name().Text()
+		}
+	}
+	return imports
+}
+
+func (tx *DeclarationTransformer) normalizeGeneratedImportedTypes(typeNode *ast.Node) *ast.Node {
+	if typeNode == nil {
+		return nil
+	}
+	namedImports := tx.generatedTypeNamedImports()
+	if len(namedImports) == 0 {
+		return typeNode
+	}
+	namespaceImports := tx.generatedTypeNamespaceImports()
+	var visitor *ast.NodeVisitor
+	visitor = tx.EmitContext().NewNodeVisitor(func(node *ast.Node) *ast.Node {
+		if node != nil && node.Kind == ast.KindTypeReference {
+			typeReference := node.AsTypeReferenceNode()
+			if typeReference.TypeName != nil && typeReference.TypeName.Kind == ast.KindIdentifier {
+				imported := namedImports[typeReference.TypeName.Text()]
+				if imported.importedName == "" || imported.moduleSpecifier == "" {
+					return visitor.VisitEachChild(node)
+				}
+				typeArguments := visitor.VisitNodes(typeReference.TypeArguments)
+				if namespaceName := namespaceImports[imported.moduleSpecifier]; namespaceName != "" {
+					return tx.Factory().NewTypeReferenceNode(
+						tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier(namespaceName), tx.Factory().NewIdentifier(imported.importedName)),
+						typeArguments,
+					)
+				}
+				return tx.Factory().NewImportTypeNode(
+					false,
+					tx.Factory().NewLiteralTypeNode(tx.Factory().NewStringLiteral(imported.moduleSpecifier, ast.TokenFlagsNone)),
+					nil,
+					tx.Factory().NewIdentifier(imported.importedName),
+					typeArguments,
+				)
+			}
+		}
+		return visitor.VisitEachChild(node)
+	})
+	return visitor.VisitNode(typeNode)
+}
+
+func isEffectSchemaStructCompanionTypeAlias(statement *ast.Node, structModelNames map[string]bool) bool {
+	return ast.IsTypeAliasDeclaration(statement) && statement.Name() != nil && structModelNames[statement.Name().Text()]
+}
+
+func hasEffectSchemaOpaqueHeritage(classDeclaration *ast.Node) bool {
+	heritageType := getFirstHeritageType(classDeclaration)
+	if heritageType == nil {
+		return false
+	}
+	expression := heritageType.AsExpressionWithTypeArguments().Expression
+	if expression == nil {
+		return false
+	}
+	if ast.IsCallExpression(expression) {
+		expression = expression.AsCallExpression().Expression
+	}
+	if ast.IsCallExpression(expression) {
+		expression = expression.AsCallExpression().Expression
+	}
+	return isEffectSchemaOpaqueExpression(expression)
+}
+
+func getFirstHeritageType(classDeclaration *ast.Node) *ast.Node {
+	if classDeclaration == nil || !ast.IsClassDeclaration(classDeclaration) || classDeclaration.AsClassDeclaration().HeritageClauses == nil {
+		return nil
+	}
+	clauses := classDeclaration.AsClassDeclaration().HeritageClauses.Nodes
+	if len(clauses) == 0 || clauses[0].AsHeritageClause().Types == nil || len(clauses[0].AsHeritageClause().Types.Nodes) == 0 {
+		return nil
+	}
+	return clauses[0].AsHeritageClause().Types.Nodes[0]
+}
+
+func isEffectSchemaOpaqueExpression(expression *ast.Node) bool {
+	return getEffectSchemaCtorFacadeName(expression) != ""
+}
+
+// Maps a schema-model heritage constructor (S.Opaque(...), S.Class(...), S.ErrorClass(...), ...)
+// to the effect-app facade type its base should be rewritten to. Returns "" for non-model
+// constructors. Opaque family (incl. requests) -> OpaqueFacade; class family -> OpaqueClassFacade;
+// error family -> OpaqueErrorFacadeClass.
+func getEffectSchemaCtorFacadeName(expression *ast.Node) string {
+	if !ast.IsPropertyAccessExpression(expression) || expression.Name() == nil || expression.Expression() == nil {
+		return ""
+	}
+	left := expression.Expression()
+	if !ast.IsIdentifier(left) || (left.Text() != "S" && left.Text() != "Schema") {
+		return ""
+	}
+	switch expression.Name().Text() {
+	case "Opaque", "OpaqueFacade":
+		return "OpaqueFacade"
+	case "Class", "TaggedClass":
+		return "OpaqueClassFacade"
+	case "ErrorClass", "TaggedErrorClass":
+		return "OpaqueErrorFacadeClass"
+	default:
+		return ""
+	}
+}
+
+func getEffectSchemaClassFacadeName(classDeclaration *ast.Node) string {
+	heritageType := getFirstHeritageType(classDeclaration)
+	if heritageType == nil {
+		return "OpaqueFacade"
+	}
+	expression := heritageType.AsExpressionWithTypeArguments().Expression
+	for expression != nil && ast.IsCallExpression(expression) {
+		expression = expression.AsCallExpression().Expression
+	}
+	if expression != nil {
+		if name := getEffectSchemaCtorFacadeName(expression); name != "" {
+			return name
+		}
+	}
+	return "OpaqueFacade"
+}
+
+func isEffectSchemaModelNamespace(statement *ast.Node) bool {
+	if !ast.IsModuleDeclaration(statement) || statement.Name() == nil || !ast.IsIdentifier(statement.Name()) || statement.AsModuleDeclaration().Body == nil || statement.AsModuleDeclaration().Body.Kind != ast.KindModuleBlock {
+		return false
+	}
+	return core.Some(statement.AsModuleDeclaration().Body.AsModuleBlock().Statements.Nodes, isEffectSchemaStructNestedEncodedInterface)
+}
+
+func isEffectSchemaMaterializedModelNamespace(statement *ast.Node, classes map[string]*ast.Node) bool {
+	name := moduleDeclarationIdentifierName(statement)
+	if name == "" || classes[name] == nil || statement.AsModuleDeclaration().Body == nil || statement.AsModuleDeclaration().Body.Kind != ast.KindModuleBlock {
+		return false
+	}
+	return core.Some(statement.AsModuleDeclaration().Body.AsModuleBlock().Statements.Nodes, isEffectSchemaEncodedInterface)
+}
+
+func moduleDeclarationIdentifierName(statement *ast.Node) string {
+	if !ast.IsModuleDeclaration(statement) || statement.Name() == nil || !ast.IsIdentifier(statement.Name()) {
+		return ""
+	}
+	return statement.Name().Text()
+}
+
+func isEffectSchemaStructNestedEncodedInterface(statement *ast.Node) bool {
+	if !ast.IsInterfaceDeclaration(statement) || statement.Name() == nil || statement.Name().Text() != "Encoded" || statement.AsInterfaceDeclaration().HeritageClauses == nil {
+		return false
+	}
+	clauses := statement.AsInterfaceDeclaration().HeritageClauses.Nodes
+	if len(clauses) != 1 || clauses[0].AsHeritageClause().Types == nil || len(clauses[0].AsHeritageClause().Types.Nodes) != 1 {
+		return false
+	}
+	heritageType := clauses[0].AsHeritageClause().Types.Nodes[0]
+	expression := heritageType.AsExpressionWithTypeArguments().Expression
+	typeArguments := heritageType.AsExpressionWithTypeArguments().TypeArguments
+	return ast.IsPropertyAccessExpression(expression) &&
+		expression.Name() != nil &&
+		expression.Name().Text() == "StructNestedEncoded" &&
+		typeArguments != nil &&
+		len(typeArguments.Nodes) == 1 &&
+		typeArguments.Nodes[0].Kind == ast.KindTypeQuery
+}
+
+func isEffectSchemaStructNestedEncodedInterfaceForModel(statement *ast.Node, modelName string) bool {
+	if !isEffectSchemaStructNestedEncodedInterface(statement) {
+		return false
+	}
+	typeQuery := statement.AsInterfaceDeclaration().HeritageClauses.Nodes[0].AsHeritageClause().Types.Nodes[0].AsExpressionWithTypeArguments().TypeArguments.Nodes[0]
+	exprName := typeQuery.AsTypeQueryNode().ExprName
+	return exprName != nil && ast.IsIdentifier(exprName) && exprName.Text() == modelName
+}
+
+func (tx *DeclarationTransformer) materializeSchemaNestedEncoded(encoded *ast.Node) *ast.Node {
+	heritageType := encoded.AsInterfaceDeclaration().HeritageClauses.Nodes[0].AsHeritageClause().Types.Nodes[0]
+	return tx.resolver.CreateTypeLiteralOfTypeNode(tx.EmitContext(), heritageType, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaMaterializedEncodedDeclaration(encoded *ast.Node, classDeclaration *ast.Node) *ast.Node {
+	encodedType := tx.materializeSchemaNestedEncoded(encoded)
+	if encodedType == nil || !ast.IsTypeLiteralNode(encodedType) {
+		return nil
+	}
+	return tx.Factory().NewInterfaceDeclaration(encoded.Modifiers(), encoded.Name(), encoded.AsInterfaceDeclaration().TypeParameters, nil, tx.Factory().NewNodeList(encodedType.AsTypeLiteralNode().Members.Nodes))
+}
+
+func isEffectSchemaEncodedInterface(statement *ast.Node) bool {
+	return ast.IsInterfaceDeclaration(statement) && statement.Name() != nil && statement.Name().Text() == "Encoded"
+}
+
+func (tx *DeclarationTransformer) canCreateEffectSchemaGeneratedNamespace(classDeclaration *ast.Node) bool {
+	return tx.createEffectSchemaEncodedDeclaration(classDeclaration) != nil
+}
+
+func getEffectSchemaClassName(statement *ast.Node) string {
+	if ast.IsClassDeclaration(statement) && statement.Name() != nil {
+		return statement.Name().Text()
+	}
+	return ""
+}
+
+func hasTopLevelInterface(statements *ast.StatementList, name string) bool {
+	return core.Some(statements.Nodes, func(statement *ast.Node) bool {
+		return ast.IsInterfaceDeclaration(statement) && statement.Name() != nil && statement.Name().Text() == name
+	})
+}
+
+func hasTopLevelNamespace(statements *ast.StatementList, name string) bool {
+	return core.Some(statements.Nodes, func(statement *ast.Node) bool {
+		return moduleDeclarationIdentifierName(statement) == name
+	})
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaTypeInterface(classDeclaration *ast.Node) *ast.Node {
+	if classDeclaration == nil || classDeclaration.Name() == nil {
+		return nil
+	}
+	literal := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeLiteralOfClassDeclaration(tx.EmitContext(), classDeclaration, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if literal == nil || !ast.IsTypeLiteralNode(literal) {
+		return nil
+	}
+	return tx.Factory().NewInterfaceDeclaration(
+		tx.createEffectSchemaNamespaceModifiers(classDeclaration, false),
+		tx.Factory().NewIdentifier(classDeclaration.Name().Text()),
+		nil,
+		nil,
+		tx.Factory().NewNodeList(literal.AsTypeLiteralNode().Members.Nodes),
+	)
+}
+
+func (tx *DeclarationTransformer) updateEffectSchemaNamespaceDeclaration(namespace *ast.Node, classDeclaration *ast.Node) *ast.Node {
+	body := namespace.AsModuleDeclaration().Body
+	if body == nil || body.Kind != ast.KindModuleBlock {
+		return nil
+	}
+	replacedEncoded := false
+	existing := map[string]bool{}
+	kept := make([]*ast.Node, 0, len(body.AsModuleBlock().Statements.Nodes))
+	for _, statement := range body.AsModuleBlock().Statements.Nodes {
+		if (ast.IsInterfaceDeclaration(statement) || ast.IsTypeAliasDeclaration(statement)) && statement.Name() != nil {
+			name := statement.Name().Text()
+			if name == "Encoded" {
+				var encodedDeclaration *ast.Node
+				if isEffectSchemaStructNestedEncodedInterfaceForModel(statement, moduleDeclarationIdentifierName(namespace)) {
+					encodedDeclaration = tx.createEffectSchemaMaterializedEncodedDeclaration(statement, classDeclaration)
+				}
+				if encodedDeclaration != nil {
+					kept = append(kept, encodedDeclaration)
+					replacedEncoded = true
+					continue
+				}
+			} else {
+				existing[name] = true
+				if name == "Make" || name == "DecodingServices" || name == "EncodingServices" {
+					continue
+				}
+			}
+		}
+		kept = append(kept, statement)
+	}
+
+	additions := []*ast.Node{}
+	if makeDeclaration := tx.createEffectSchemaMakeDeclaration(classDeclaration); makeDeclaration != nil {
+		additions = append(additions, makeDeclaration)
+	}
+	if decodingServices := tx.createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices"); decodingServices != nil {
+		additions = append(additions, decodingServices)
+	}
+	if encodingServices := tx.createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices"); encodingServices != nil {
+		additions = append(additions, encodingServices)
+	}
+	if !existing["Fields"] {
+		if fieldsDeclaration := tx.createEffectSchemaFieldsDeclaration(classDeclaration); fieldsDeclaration != nil {
+			additions = append([]*ast.Node{fieldsDeclaration}, additions...)
+		}
+	}
+	if !replacedEncoded && len(additions) == 0 && len(existing) == 0 {
+		return nil
+	}
+
+	statements := tx.Factory().NewNodeList(append(kept, additions...))
+	moduleBlock := tx.Factory().UpdateModuleBlock(body.AsModuleBlock(), statements)
+	return tx.Factory().UpdateModuleDeclaration(namespace.AsModuleDeclaration(), namespace.Modifiers(), namespace.AsModuleDeclaration().Keyword, namespace.Name(), moduleBlock)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaGeneratedNamespaceDeclaration(modelName string, classDeclaration *ast.Node) *ast.Node {
+	encoded := tx.createEffectSchemaEncodedDeclaration(classDeclaration)
+	if encoded == nil {
+		return nil
+	}
+	statements := []*ast.Node{encoded}
+	if fieldsDeclaration := tx.createEffectSchemaFieldsDeclaration(classDeclaration); fieldsDeclaration != nil {
+		statements = append(statements, fieldsDeclaration)
+	}
+	if makeDeclaration := tx.createEffectSchemaMakeDeclaration(classDeclaration); makeDeclaration != nil {
+		statements = append(statements, makeDeclaration)
+	}
+	if decodingServices := tx.createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices"); decodingServices != nil {
+		statements = append(statements, decodingServices)
+	}
+	if encodingServices := tx.createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices"); encodingServices != nil {
+		statements = append(statements, encodingServices)
+	}
+	return tx.Factory().NewModuleDeclaration(
+		tx.createEffectSchemaNamespaceModifiers(classDeclaration, true),
+		ast.KindNamespaceKeyword,
+		tx.Factory().NewIdentifier(modelName),
+		tx.Factory().NewModuleBlock(tx.Factory().NewNodeList(statements)),
+	)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaNamespaceModifiers(classDeclaration *ast.Node, includeDeclare bool) *ast.ModifierList {
+	modifiers := []*ast.Node{}
+	if ast.HasSyntacticModifier(classDeclaration, ast.ModifierFlagsExport) {
+		modifiers = append(modifiers, tx.Factory().NewModifier(ast.KindExportKeyword))
+	}
+	if includeDeclare {
+		modifiers = append(modifiers, tx.Factory().NewModifier(ast.KindDeclareKeyword))
+	}
+	if len(modifiers) == 0 {
+		return nil
+	}
+	return tx.Factory().NewModifierList(modifiers)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaFieldsDeclaration(classDeclaration *ast.Node) *ast.Node {
+	fieldsType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "fields", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if fieldsType == nil || fieldsType.Kind == ast.KindAnyKeyword {
+		return nil
+	}
+	if ast.IsTypeLiteralNode(fieldsType) {
+		return tx.Factory().NewInterfaceDeclaration(nil, tx.Factory().NewIdentifier("Fields"), nil, nil, tx.Factory().NewNodeList(fieldsType.AsTypeLiteralNode().Members.Nodes))
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier("Fields"), nil, fieldsType)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaEncodedDeclaration(classDeclaration *ast.Node) *ast.Node {
+	encodedType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "Encoded", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if encodedType == nil {
+		return nil
+	}
+	if ast.IsTypeLiteralNode(encodedType) {
+		return tx.Factory().NewInterfaceDeclaration(nil, tx.Factory().NewIdentifier("Encoded"), nil, nil, tx.Factory().NewNodeList(encodedType.AsTypeLiteralNode().Members.Nodes))
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier("Encoded"), nil, encodedType)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaMakeDeclaration(classDeclaration *ast.Node) *ast.Node {
+	makeType := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateMakeTypeOfClassDeclaration(tx.EmitContext(), classDeclaration, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if makeType == nil {
+		makeType = tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, "~type.make.in", tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	}
+	if makeType == nil {
+		return nil
+	}
+	if ast.IsTypeLiteralNode(makeType) {
+		return tx.Factory().NewInterfaceDeclaration(nil, tx.Factory().NewIdentifier("Make"), nil, nil, tx.Factory().NewNodeList(makeType.AsTypeLiteralNode().Members.Nodes))
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier("Make"), nil, makeType)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaServiceDeclaration(classDeclaration *ast.Node, name string) *ast.Node {
+	resolved := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if resolved == nil {
+		return nil
+	}
+	serviceType := resolved
+	if resolved.Kind == ast.KindAnyKeyword {
+		serviceType = tx.Factory().NewKeywordTypeNode(ast.KindNeverKeyword)
+	}
+	return tx.Factory().NewTypeAliasDeclaration(nil, tx.Factory().NewIdentifier(name), nil, serviceType)
+}
+
+func getEffectSchemaBaseModelName(statement *ast.Node) string {
+	if !ast.IsVariableStatement(statement) || statement.AsVariableStatement().DeclarationList == nil {
+		return ""
+	}
+	declarations := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes
+	if len(declarations) != 1 || declarations[0].Name() == nil || !ast.IsIdentifier(declarations[0].Name()) {
+		return ""
+	}
+	name := declarations[0].Name().Text()
+	if !strings.HasSuffix(name, "_base") {
+		return ""
+	}
+	baseName := strings.TrimSuffix(name, "_base")
+	return strings.TrimPrefix(baseName, "__")
+}
+
+func (tx *DeclarationTransformer) updateEffectSchemaBaseDeclaration(statement *ast.Node, modelName string, classDeclaration *ast.Node, usesIntermediateClass bool) *ast.Node {
+	declaration := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes[0]
+	name := declaration.Name()
+	if usesIntermediateClass {
+		name = tx.Factory().NewIdentifier("__" + modelName + "_base")
+	}
+	updatedDeclaration := tx.Factory().UpdateVariableDeclaration(
+		declaration.AsVariableDeclaration(),
+		name,
+		declaration.AsVariableDeclaration().ExclamationToken,
+		tx.createEffectSchemaFacadeBaseType(modelName, classDeclaration, declaration.AsVariableDeclaration().Type),
+		declaration.AsVariableDeclaration().Initializer,
+	)
+	declarations := tx.Factory().NewNodeList([]*ast.Node{updatedDeclaration})
+	declarationList := tx.Factory().UpdateVariableDeclarationList(statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList(), declarations, statement.AsVariableStatement().DeclarationList.Flags)
+	return tx.Factory().UpdateVariableStatement(statement.AsVariableStatement(), statement.Modifiers(), declarationList)
+}
+
+func getEffectSchemaRequestBaseInfo(statement *ast.Node) (effectSchemaRequestBaseInfo, bool) {
+	if !ast.IsVariableStatement(statement) || statement.AsVariableStatement().DeclarationList == nil {
+		return effectSchemaRequestBaseInfo{}, false
+	}
+	declarations := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes
+	if len(declarations) != 1 || declarations[0].Name() == nil || !ast.IsIdentifier(declarations[0].Name()) || declarations[0].Type() == nil {
+		return effectSchemaRequestBaseInfo{}, false
+	}
+	modelName := getEffectSchemaBaseModelName(statement)
+	if modelName == "" {
+		return effectSchemaRequestBaseInfo{}, false
+	}
+	opaqueType := getEffectSchemaRequestOpaqueType(declarations[0].Type(), modelName)
+	if opaqueType == nil || opaqueType.AsTypeReferenceNode().TypeArguments == nil || len(opaqueType.AsTypeReferenceNode().TypeArguments.Nodes) < 4 {
+		return effectSchemaRequestBaseInfo{}, false
+	}
+	return effectSchemaRequestBaseInfo{modelName: modelName, brand: opaqueType.AsTypeReferenceNode().TypeArguments.Nodes[3]}, true
+}
+
+func getEffectSchemaRequestOpaqueType(typeNode *ast.Node, modelName string) *ast.Node {
+	if isEffectSchemaRequestOpaqueType(typeNode, modelName) {
+		return typeNode
+	}
+	if typeNode == nil || typeNode.Kind != ast.KindIntersectionType {
+		return nil
+	}
+	for _, part := range typeNode.AsIntersectionTypeNode().Types.Nodes {
+		if isEffectSchemaRequestOpaqueType(part, modelName) {
+			return part
+		}
+	}
+	return nil
+}
+
+func isEffectSchemaRequestOpaqueType(typeNode *ast.Node, modelName string) bool {
+	if typeNode == nil || typeNode.Kind != ast.KindTypeReference {
+		return false
+	}
+	typeName := typeNode.AsTypeReferenceNode().TypeName
+	if typeName == nil || typeName.Kind != ast.KindQualifiedName {
+		return false
+	}
+	qualifiedName := typeName.AsQualifiedName()
+	if qualifiedName.Right.Text() != "Opaque" || qualifiedName.Left == nil || qualifiedName.Left.Kind != ast.KindIdentifier || qualifiedName.Left.Text() != "S" {
+		return false
+	}
+	typeArguments := typeNode.AsTypeReferenceNode().TypeArguments
+	if typeArguments == nil || len(typeArguments.Nodes) < 4 {
+		return false
+	}
+	return isEffectSchemaNamedTypeReference(typeArguments.Nodes[0], modelName) && isEffectSchemaExtendedSchemaNoEncodedType(typeArguments.Nodes[1])
+}
+
+func isEffectSchemaNamedTypeReference(typeNode *ast.Node, name string) bool {
+	return typeNode != nil && typeNode.Kind == ast.KindTypeReference && typeNode.AsTypeReferenceNode().TypeName.Kind == ast.KindIdentifier && typeNode.AsTypeReferenceNode().TypeName.Text() == name
+}
+
+func isEffectSchemaExtendedSchemaNoEncodedType(typeNode *ast.Node) bool {
+	if typeNode == nil || typeNode.Kind != ast.KindTypeQuery {
+		return false
+	}
+	exprName := typeNode.AsTypeQueryNode().ExprName
+	if exprName == nil || exprName.Kind != ast.KindQualifiedName {
+		return false
+	}
+	qualifiedName := exprName.AsQualifiedName()
+	return qualifiedName.Right.Text() == "ExtendedSchemaNoEncoded" && qualifiedName.Left != nil && qualifiedName.Left.Kind == ast.KindIdentifier && qualifiedName.Left.Text() == "S"
+}
+
+func (tx *DeclarationTransformer) updateEffectSchemaRequestBaseDeclaration(statement *ast.Node, info effectSchemaRequestBaseInfo) *ast.Node {
+	declaration := statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes[0]
+	updatedType := tx.updateEffectSchemaRequestBaseType(declaration.Type(), info)
+	if updatedType == nil {
+		return nil
+	}
+	updatedDeclaration := tx.Factory().UpdateVariableDeclaration(
+		declaration.AsVariableDeclaration(),
+		declaration.Name(),
+		declaration.AsVariableDeclaration().ExclamationToken,
+		updatedType,
+		declaration.AsVariableDeclaration().Initializer,
+	)
+	declarations := tx.Factory().NewNodeList([]*ast.Node{updatedDeclaration})
+	declarationList := tx.Factory().UpdateVariableDeclarationList(statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList(), declarations, statement.AsVariableStatement().DeclarationList.Flags)
+	return tx.Factory().UpdateVariableStatement(statement.AsVariableStatement(), statement.Modifiers(), declarationList)
+}
+
+func (tx *DeclarationTransformer) updateEffectSchemaRequestBaseType(typeNode *ast.Node, info effectSchemaRequestBaseInfo) *ast.Node {
+	if isEffectSchemaRequestOpaqueType(typeNode, info.modelName) {
+		return tx.createEffectSchemaFacadeTypeReference(info.modelName, info.brand, "OpaqueFacade")
+	}
+	if typeNode == nil || typeNode.Kind != ast.KindIntersectionType {
+		return nil
+	}
+	changed := false
+	types := make([]*ast.Node, 0, len(typeNode.AsIntersectionTypeNode().Types.Nodes))
+	for _, part := range typeNode.AsIntersectionTypeNode().Types.Nodes {
+		if isEffectSchemaRequestOpaqueType(part, info.modelName) {
+			changed = true
+			types = append(types, tx.createEffectSchemaFacadeTypeReference(info.modelName, info.brand, "OpaqueFacade"))
+		} else {
+			types = append(types, part)
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return tx.Factory().UpdateIntersectionTypeNode(typeNode.AsIntersectionTypeNode(), tx.Factory().NewNodeList(types))
+}
+
+func needsEffectSchemaIntermediateClass(classDeclaration *ast.Node) bool {
+	return classDeclaration != nil && classDeclaration.ClassLikeData() != nil && len(classDeclaration.ClassLikeData().Members.Nodes) > 0
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaIntermediateClass(modelName string) *ast.Node {
+	return tx.Factory().NewClassDeclaration(
+		tx.Factory().NewModifierList([]*ast.Node{tx.Factory().NewModifier(ast.KindDeclareKeyword)}),
+		tx.Factory().NewIdentifier("__"+modelName),
+		nil,
+		tx.Factory().NewNodeList([]*ast.Node{
+			tx.Factory().NewHeritageClause(ast.KindExtendsKeyword, tx.Factory().NewNodeList([]*ast.Node{
+				tx.Factory().NewExpressionWithTypeArguments(tx.Factory().NewIdentifier("__"+modelName+"_base"), nil),
+			})),
+		}),
+		tx.Factory().NewNodeList([]*ast.Node{}),
+	)
+}
+
+func (tx *DeclarationTransformer) updateEffectSchemaClassDeclaration(classDeclaration *ast.Node, modelName string) *ast.Node {
+	return tx.Factory().UpdateClassDeclaration(
+		classDeclaration.AsClassDeclaration(),
+		classDeclaration.Modifiers(),
+		classDeclaration.Name(),
+		classDeclaration.AsClassDeclaration().TypeParameters,
+		tx.Factory().NewNodeList([]*ast.Node{
+			tx.Factory().NewHeritageClause(ast.KindExtendsKeyword, tx.Factory().NewNodeList([]*ast.Node{
+				tx.Factory().NewExpressionWithTypeArguments(tx.Factory().NewIdentifier("__"+modelName), nil),
+			})),
+		}),
+		classDeclaration.AsClassDeclaration().Members,
+	)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaFacadeBaseType(modelName string, classDeclaration *ast.Node, baseType *ast.Node) *ast.Node {
+	facadeName := getEffectSchemaClassFacadeName(classDeclaration)
+	brandType := tx.getEffectSchemaFacadeBrandType(baseType, facadeName)
+	return tx.Factory().NewIntersectionTypeNode(tx.Factory().NewNodeList([]*ast.Node{
+		tx.createEffectSchemaFacadeTypeReference(modelName, brandType, facadeName),
+		tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList(tx.createEffectSchemaStaticMembers(classDeclaration, modelName))),
+	}))
+}
+
+// The facade's Brand (last type arg). For the class/error families the source base is
+// S.EnhancedClass<Self, Schema, Inherited> — the 3rd arg is the brand (e.g. Cause.YieldableError
+// for errors); preserve it. The Opaque family carries no brand on the base, so use {}.
+func (tx *DeclarationTransformer) getEffectSchemaFacadeBrandType(baseType *ast.Node, facadeName string) *ast.Node {
+	empty := tx.Factory().NewTypeLiteralNode(tx.Factory().NewNodeList([]*ast.Node{}))
+	if facadeName == "OpaqueFacade" || baseType == nil {
+		return empty
+	}
+	typeNode := baseType
+	if ast.IsIntersectionTypeNode(typeNode) {
+		nodes := typeNode.AsIntersectionTypeNode().Types.Nodes
+		if len(nodes) == 0 {
+			return empty
+		}
+		typeNode = nodes[0]
+	}
+	if typeNode.Kind != ast.KindTypeReference || typeNode.AsTypeReferenceNode().TypeArguments == nil {
+		return empty
+	}
+	args := typeNode.AsTypeReferenceNode().TypeArguments.Nodes
+	if len(args) >= 3 {
+		return args[2]
+	}
+	return empty
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaFacadeTypeReference(modelName string, brandType *ast.Node, facadeName string) *ast.Node {
+	model := tx.Factory().NewIdentifier(modelName)
+	return tx.Factory().NewTypeReferenceNode(
+		tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier("S"), tx.Factory().NewIdentifier(facadeName)),
+		tx.Factory().NewNodeList([]*ast.Node{
+			tx.Factory().NewTypeReferenceNode(model, nil),
+			tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(model, tx.Factory().NewIdentifier("Encoded")), nil),
+			tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(model, tx.Factory().NewIdentifier("Make")), nil),
+			tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(model, tx.Factory().NewIdentifier("DecodingServices")), nil),
+			tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(model, tx.Factory().NewIdentifier("EncodingServices")), nil),
+			brandType,
+		}),
+	)
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaStaticMembers(classDeclaration *ast.Node, modelName string) []*ast.Node {
+	members := []*ast.Node{}
+	hasFields := tx.createEffectSchemaFieldsDeclaration(classDeclaration) != nil
+	// NOTE: `identifier` (generic `string`) is intentionally NOT emitted here — it lives on the
+	// facade interfaces (OpaqueFacade/OpaqueClassFacade/OpaqueErrorFacadeClass) in effect-app.
+	// Only per-model, precisely-typed statics belong here.
+	tx.addSchemaStaticMember(&members, classDeclaration, "fields", true, core.IfElse(hasFields, modelName, ""))
+	tx.addSchemaStaticMember(&members, classDeclaration, "mapFields", false, core.IfElse(hasFields, modelName, ""))
+	tx.addSchemaStaticMember(&members, classDeclaration, "to", true, "")
+	tx.addSchemaStaticMember(&members, classDeclaration, "from", true, "")
+	tx.addSchemaStaticMember(&members, classDeclaration, "copy", true, modelName)
+	return members
+}
+
+func (tx *DeclarationTransformer) createEffectSchemaNamedMemberReference(modelName string, memberName string) *ast.Node {
+	return tx.Factory().NewTypeReferenceNode(tx.Factory().NewQualifiedName(tx.Factory().NewIdentifier(modelName), tx.Factory().NewIdentifier(memberName)), nil)
+}
+
+func (tx *DeclarationTransformer) rewriteEffectSchemaStaticMemberType(typeNode *ast.Node, name string, modelName string) *ast.Node {
+	switch name {
+	case "fields":
+		return tx.createEffectSchemaNamedMemberReference(modelName, "Fields")
+	case "mapFields":
+		return tx.rewriteEffectSchemaMapFieldsType(typeNode, modelName)
+	case "copy":
+		return tx.rewriteEffectSchemaCopyType(typeNode, modelName)
+	default:
+		return typeNode
+	}
+}
+
+func (tx *DeclarationTransformer) rewriteEffectSchemaMapFieldsType(typeNode *ast.Node, modelName string) *ast.Node {
+	if typeNode == nil || typeNode.Kind != ast.KindFunctionType {
+		return typeNode
+	}
+	mapFieldsType := typeNode.AsFunctionTypeNode()
+	if mapFieldsType.Parameters == nil || len(mapFieldsType.Parameters.Nodes) == 0 {
+		return typeNode
+	}
+	callbackParameter := mapFieldsType.Parameters.Nodes[0].AsParameterDeclaration()
+	callbackType := callbackParameter.Type
+	if callbackType == nil || callbackType.Kind != ast.KindFunctionType {
+		return typeNode
+	}
+	callbackFunctionType := callbackType.AsFunctionTypeNode()
+	if callbackFunctionType.Parameters == nil || len(callbackFunctionType.Parameters.Nodes) == 0 {
+		return typeNode
+	}
+	fieldsParameter := callbackFunctionType.Parameters.Nodes[0].AsParameterDeclaration()
+	updatedFieldsParameter := tx.Factory().UpdateParameterDeclaration(
+		fieldsParameter,
+		fieldsParameter.Modifiers(),
+		fieldsParameter.DotDotDotToken,
+		fieldsParameter.Name(),
+		fieldsParameter.QuestionToken,
+		tx.createEffectSchemaNamedMemberReference(modelName, "Fields"),
+		fieldsParameter.Initializer,
+	)
+	updatedCallbackParameters := append([]*ast.Node{updatedFieldsParameter}, callbackFunctionType.Parameters.Nodes[1:]...)
+	updatedCallbackType := tx.Factory().UpdateFunctionTypeNode(
+		callbackFunctionType,
+		callbackFunctionType.TypeParameters,
+		tx.Factory().NewNodeList(updatedCallbackParameters),
+		callbackFunctionType.Type,
+	)
+	updatedCallbackParameter := tx.Factory().UpdateParameterDeclaration(
+		callbackParameter,
+		callbackParameter.Modifiers(),
+		callbackParameter.DotDotDotToken,
+		callbackParameter.Name(),
+		callbackParameter.QuestionToken,
+		updatedCallbackType,
+		callbackParameter.Initializer,
+	)
+	updatedMapFieldsParameters := append([]*ast.Node{updatedCallbackParameter}, mapFieldsType.Parameters.Nodes[1:]...)
+	return tx.Factory().UpdateFunctionTypeNode(
+		mapFieldsType,
+		mapFieldsType.TypeParameters,
+		tx.Factory().NewNodeList(updatedMapFieldsParameters),
+		mapFieldsType.Type,
+	)
+}
+
+func (tx *DeclarationTransformer) rewriteEffectSchemaCopyType(typeNode *ast.Node, modelName string) *ast.Node {
+	model := tx.Factory().NewTypeReferenceNode(tx.Factory().NewIdentifier(modelName), nil)
+	if ast.IsImportTypeNode(typeNode) {
+		importType := typeNode.AsImportTypeNode()
+		if importType.Qualifier != nil && rightmostEntityNameText(importType.Qualifier) == "StructuralCopyOrigin" {
+			return tx.Factory().UpdateImportTypeNode(importType, importType.IsTypeOf, importType.Argument, importType.Attributes, importType.Qualifier, tx.Factory().NewNodeList([]*ast.Node{model}))
+		}
+		return typeNode
+	}
+	if ast.IsTypeReferenceNode(typeNode) && rightmostEntityNameText(typeNode.AsTypeReferenceNode().TypeName) == "StructuralCopyOrigin" {
+		return tx.Factory().UpdateTypeReferenceNode(typeNode.AsTypeReferenceNode(), typeNode.AsTypeReferenceNode().TypeName, tx.Factory().NewNodeList([]*ast.Node{model}))
+	}
+	return typeNode
+}
+
+func rightmostEntityNameText(name *ast.Node) string {
+	if ast.IsIdentifier(name) {
+		return name.Text()
+	}
+	if ast.IsQualifiedName(name) {
+		return name.AsQualifiedName().Right.Text()
+	}
+	return ""
+}
+
+func (tx *DeclarationTransformer) addSchemaStaticMember(members *[]*ast.Node, classDeclaration *ast.Node, name string, readonly bool, modelName string) {
+	typeNode := tx.normalizeGeneratedImportedTypes(tx.resolver.CreateTypeOfClassStaticProperty(tx.EmitContext(), classDeclaration, name, tx.enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, tx.tracker))
+	if typeNode == nil || typeNode.Kind == ast.KindAnyKeyword {
+		return
+	}
+	var modifiers *ast.ModifierList
+	if readonly {
+		modifiers = tx.Factory().NewModifierList([]*ast.Node{tx.Factory().NewModifier(ast.KindReadonlyKeyword)})
+	}
+	if modelName != "" {
+		typeNode = tx.rewriteEffectSchemaStaticMemberType(typeNode, name, modelName)
+	}
+	*members = append(*members, tx.Factory().NewPropertySignatureDeclaration(modifiers, tx.Factory().NewIdentifier(name), nil, typeNode, nil))
 }
 
 func (tx *DeclarationTransformer) ensureModifiers(node *ast.Node) *ast.ModifierList {

@@ -114,6 +114,11 @@ Disable emitting files from a compilation.
 type: boolean
 default: false
 
+[94m--disableEffectAppDtsFacades[39m
+Disable effect-app declaration facade emit.
+type: boolean
+default: false
+
 [94m--assumeChangesOnlyAffectDirectDependencies[39m
 Have recompiles in projects that use 'incremental' and 'watch' mode assume that changes within a file will only affect files directly depending on it.
 type: boolean

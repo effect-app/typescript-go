@@ -242,6 +242,8 @@ func parseCompilerOptions(key string, value any, allOptions *core.CompilerOption
 		allOptions.DeduplicatePackages = ParseTristate(value)
 	case "diagnostics":
 		allOptions.Diagnostics = ParseTristate(value)
+	case "disableEffectAppDtsFacades":
+		allOptions.DisableEffectAppDtsFacades = ParseTristate(value)
 	case "disableSizeLimit":
 		allOptions.DisableSizeLimit = ParseTristate(value)
 	case "disableSourceOfProjectReferenceRedirect":
